@@ -289,28 +289,12 @@ class DataParallelPPOActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
-        """Compute the log probability of the responses given input_ids, attention_mask and position_ids
-
-        Args:
-            data (DataProto): a DataProto containing keys
-
-                ``input_ids``: tensor of shape [batch_size, sequence_length]. torch.int64. Note that input_ids is the
-                concatenation of prompt and response. Note that ``sequence_length = prompt_length + response_length``.
-
-                ``attention_mask``: tensor of shape [batch_size, sequence_length]. torch.int64.
-
-                ``position_ids``: tensor of shape [batch_size, sequence_length]. torch.int64.
-
-                ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
-
-        Returns:
-            torch.Tensor: the log_prob tensor
-        """
+        """Compute the log probability of the responses given input_ids, attention_mask and position_ids"""
         # set to eval
         self.actor_module.eval()
 
         micro_batch_size = data.meta_info["micro_batch_size"]
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
@@ -353,7 +337,7 @@ class DataParallelPPOActor(BasePPOActor):
         # make sure we are in training mode
         self.actor_module.train()
 
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        temperature = data.meta_info["temperature"]
 
         select_keys = [
             "responses",
@@ -372,8 +356,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
-        # Split to make minibatch iterator for updating the actor
-        # See PPO paper for details. https://arxiv.org/abs/1707.06347
+        # Split to make minibatch iterator
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
@@ -408,7 +391,6 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
-                    # all return: (bsz, response_length)
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
@@ -416,9 +398,29 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                    # =========================================================================
+                    # 修复: 健壮地读取 loss_mode
+                    # =========================================================================
+                    if isinstance(self.config.policy_loss, str):
+                        loss_mode = self.config.policy_loss
+                    else:
+                        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-                    if self.config.policy_loss.loss_mode == "vanilla":
+                    # =========================================================================
+                    # 新增: distillation 模式 (Pure Policy Gradient / No Clipping)
+                    # =========================================================================
+                    if loss_mode == "distillation":
+                        # 直接最大化 (advantages * log_prob)
+                        # 我们假设 advantages 已经包含了 (log P_T - log P_S) 的信号
+                        # 这是一个无偏的 KL 散度梯度估计
+                        pg_loss = -verl_F.masked_mean(advantages * log_prob, response_mask)
+                        
+                        # 占位符，避免日志报错
+                        pg_clipfrac = torch.tensor(0.0, device=pg_loss.device)
+                        ppo_kl = torch.tensor(0.0, device=pg_loss.device)
+                        pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+
+                    elif loss_mode == "vanilla":
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
@@ -444,15 +446,12 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
@@ -463,7 +462,6 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
                         loss = policy_loss * (response_mask.shape[0] / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
