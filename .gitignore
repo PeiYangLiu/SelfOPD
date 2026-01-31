@@ -124,3 +124,5 @@ logs
 log
 outputs
 .history
+verl_log
+verl_checkpoints
