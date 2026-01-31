@@ -74,41 +74,74 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
 
     def init_workers(self):
         """
-        Manually split resources and initialize two independent vLLM-enabled workers.
+        初始化 Worker，支持多机多卡 (Multi-Node) 自动分配与检查。
         """
-        # 1. Calculate Resource Split
+        # 1. 获取资源配置
         n_gpus_per_node = self.config.trainer.n_gpus_per_node
         n_nodes = self.config.trainer.nnodes
         
-        # === FIX: 调整分配比例 ===
-        # 之前的逻辑: student_gpus = n_gpus_per_node // 2 (4:4)
-        # 新的逻辑: 尽可能多给 Student，Teacher 保留 1-2 张即可
-        
+        # === 资源切分策略 (7:1) ===
         if n_gpus_per_node >= 8:
-            teacher_gpus = 1  # 8卡机器：7 Student : 1 Teacher
+            teacher_gpus_per_node = 1
         elif n_gpus_per_node >= 4:
-            teacher_gpus = 1  # 4卡机器：3 Student : 1 Teacher
+            teacher_gpus_per_node = 1
         else:
-            teacher_gpus = 1  # 至少给1张
+            teacher_gpus_per_node = 1 # 至少给1张
             
-        student_gpus = n_gpus_per_node - teacher_gpus
+        student_gpus_per_node = n_gpus_per_node - teacher_gpus_per_node
         
-        if student_gpus < 1:
-            raise ValueError(f"Not enough GPUs! Need at least 2 GPUs per node.")
-            
-        print(f">>> Resource Splitting: Student={student_gpus} GPUs, Teacher={teacher_gpus} GPUs (per node)")
-        # =========================
+        if student_gpus_per_node < 1:
+            raise ValueError(f"Not enough GPUs per node! Got {n_gpus_per_node}, need at least 2.")
 
-        # 2. Create Independent Resource Pools
+        # 计算总的 World Size
+        student_world_size = student_gpus_per_node * n_nodes
+        teacher_world_size = teacher_gpus_per_node * n_nodes
+        
+        print(f"\n{'='*20} Multi-Node Topology Setup {'='*20}")
+        print(f">>> Nodes: {n_nodes} | GPUs per Node: {n_gpus_per_node}")
+        print(f">>> Student (Actor): {student_gpus_per_node} GPUs/node * {n_nodes} nodes = {student_world_size} Total GPUs")
+        print(f">>> Teacher (Ref):   {teacher_gpus_per_node} GPUs/node * {n_nodes} nodes = {teacher_world_size} Total GPUs")
+
+        # === 关键检查: Batch Size 整除性 (防止启动后报错) ===
+        # 规则: ppo_mini_batch_size 必须能被 (Student_World_Size * Micro_Batch) 整除
+        # 或者至少: (ppo_mini_batch_size / Student_World_Size) 必须是整数，且能被 Micro_Batch 整除
+        
+        mini_batch = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        micro_batch = self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+        
+        # 1. 检查每张卡分到的 Batch 是否为整数
+        if mini_batch % student_world_size != 0:
+            suggested = (mini_batch // student_world_size + 1) * student_world_size
+            raise ValueError(
+                f"\n[Config Error] ppo_mini_batch_size ({mini_batch}) cannot be divided evenly by Student World Size ({student_world_size}).\n"
+                f"Student GPUs = {student_world_size} (Nodes: {n_nodes} * GPUs: {student_gpus_per_node})\n"
+                f"Suggested ppo_mini_batch_size: {suggested} or {suggested + student_world_size}"
+            )
+            
+        local_batch = mini_batch // student_world_size
+        
+        # 2. 检查每张卡的 Local Batch 是否能被 Micro Batch 整除
+        if local_batch % micro_batch != 0:
+            raise ValueError(
+                f"\n[Config Error] Local Batch ({local_batch}) cannot be divided by Micro Batch ({micro_batch}).\n"
+                f"Global Mini Batch: {mini_batch}, Student World Size: {student_world_size}\n"
+                f"Please adjust ppo_mini_batch_size or ppo_micro_batch_size_per_gpu."
+            )
+            
+        print(f">>> Batch Check Passed: Global={mini_batch} -> PerGPU={local_batch} -> Micro={micro_batch} (Accum={local_batch//micro_batch})")
+        print(f"{'='*60}\n")
+
+        # 2. 创建资源池 (RayResourcePool 会自动处理跨节点调度)
+        # process_on_nodes=[N, N] 表示 Node 0 需要 N 张卡，Node 1 需要 N 张卡...
         student_pool = RayResourcePool(
-            process_on_nodes=[student_gpus] * n_nodes,
+            process_on_nodes=[student_gpus_per_node] * n_nodes,
             use_gpu=True,
             max_colocate_count=1,
             name_prefix="student_pool"
         )
         
         teacher_pool = RayResourcePool(
-            process_on_nodes=[teacher_gpus] * n_nodes,
+            process_on_nodes=[teacher_gpus_per_node] * n_nodes,
             use_gpu=True,
             max_colocate_count=1,
             name_prefix="teacher_pool"
@@ -116,14 +149,8 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
         
         self.resource_pool_to_cls = {student_pool: {}, teacher_pool: {}}
 
-        # 3. Initialize Student (Actor) Config
+        # 3. 初始化 Config
         student_config = deepcopy(self.config.actor_rollout_ref)
-        
-        # === FIX: 显式更新 DP/TP 设置 ===
-        # 你的脚本里 tensor_model_parallel_size=1，所以我们是在增加 DP worker 数量
-        # RayWorkerGroup 会根据资源池大小自动启动对应数量的 Worker
-        # 这里不需要改 config，因为 config 传进去的是单卡配置
-        
         student_cls = RayClassWithInitArgs(
             cls=self.role_worker_mapping[Role.ActorRollout],
             config=student_config,
@@ -132,51 +159,19 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
         )
         self.resource_pool_to_cls[student_pool]["actor_rollout"] = student_cls
 
-        # 4. Initialize Teacher (Ref) Config
         teacher_config = deepcopy(self.config.actor_rollout_ref)
-        
-        # 针对 Teacher (1张卡) 优化显存
-        # 如果 1 张卡吃不下 256 batch，调小它的 micro_batch
-        # 注意：这里的 log_prob_micro_batch_size_per_gpu 是配置里的，
-        # 如果你原来设的是 4，现在 Teacher 只有 1 张卡，它一次处理 4 条，完全没问题。
-        # 如果 OOM，可以在这里强制改小：
-        # teacher_config.ref.log_prob_micro_batch_size_per_gpu = 2 
+        # 显存优化: Teacher 显存占用降低
+        teacher_config.rollout.gpu_memory_utilization = 0.2
         
         teacher_cls = RayClassWithInitArgs(
             cls=self.role_worker_mapping[Role.RefPolicy],
             config=teacher_config,
-            role="actor_rollout", 
-            profile_option=self.config.trainer.npu_profile.options,
-        )
-        self.resource_pool_to_cls[teacher_pool]["ref"] = teacher_cls
-
-        # 3. Initialize Student (Actor) Config
-        # Deepcopy to prevent config pollution
-        student_config = deepcopy(self.config.actor_rollout_ref)
-        # Adjust micro_batch_size if necessary (optional, but good practice since world_size changed)
-        # student_config.actor.ppo_mini_batch_size //= 2 # Logic handled by worker usually
-        
-        student_cls = RayClassWithInitArgs(
-            cls=self.role_worker_mapping[Role.ActorRollout],
-            config=student_config,
             role="actor_rollout",
             profile_option=self.config.trainer.npu_profile.options,
         )
-        self.resource_pool_to_cls[student_pool]["actor_rollout"] = student_cls
-
-        # 4. Initialize Teacher (Ref) Config
-        # We define it as 'actor_rollout' role to FORCE vLLM initialization.
-        teacher_config = deepcopy(self.config.actor_rollout_ref)
-        
-        teacher_cls = RayClassWithInitArgs(
-            cls=self.role_worker_mapping[Role.RefPolicy],
-            config=teacher_config,
-            role="actor_rollout", # <--- Hack: Pretend to be Actor to enable vLLM
-            profile_option=self.config.trainer.npu_profile.options,
-        )
         self.resource_pool_to_cls[teacher_pool]["ref"] = teacher_cls
 
-        # 5. Spawn Workers
+        # 4. 启动 Workers
         all_wg = {}
         wg_kwargs = {
             "ray_wait_register_center_timeout": self.config.trainer.ray_wait_register_center_timeout,
@@ -193,14 +188,12 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
 
-        # 6. Bind to Trainer
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
         
         self.ref_policy_wg = all_wg["ref"]
         self.ref_policy_wg.init_model()
             
-        # Async Rollout Manager (Only for Student)
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == 'async':
             from verl.experimental.agent_loop import AgentLoopManager
