@@ -160,8 +160,14 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
         self.resource_pool_to_cls[student_pool]["actor_rollout"] = student_cls
 
         teacher_config = deepcopy(self.config.actor_rollout_ref)
-        # 显存优化: Teacher 显存占用降低
-        teacher_config.rollout.gpu_memory_utilization = 0.2
+        # === FIX: 调整 Teacher vLLM 显存 ===
+        # 之前设为 0.2 导致 8k 长度下 vLLM 无法初始化 KV Cache。
+        # 现在设为 0.5 (给 vLLM 50%，留 50% 给 PyTorch Forward)
+        # 配合 torch_dtype=bfloat16，这应该是够用的。
+        teacher_config.rollout.gpu_memory_utilization = 0.5 
+        
+        # 确保 Teacher 也是 bf16 (如果 config 里没传)
+        teacher_config.model.torch_dtype = "bfloat16" 
         
         teacher_cls = RayClassWithInitArgs(
             cls=self.role_worker_mapping[Role.RefPolicy],
