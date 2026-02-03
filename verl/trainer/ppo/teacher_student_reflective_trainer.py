@@ -151,6 +151,9 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
 
             # 3. 初始化 Config
             student_config = deepcopy(self.config.actor_rollout_ref)
+            raw_max_len = self.config.data.max_prompt_length + self.config.data.max_response_length
+            safe_max_model_len = raw_max_len + 512 
+            student_config.rollout.max_model_len = safe_max_model_len # <--- 修复 vLLM 长度限制
             student_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=student_config,
@@ -168,7 +171,8 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             
             # 确保 Teacher 也是 bf16 (如果 config 里没传)
             teacher_config.model.torch_dtype = "bfloat16" 
-            
+            teacher_config.rollout.max_model_len = safe_max_model_len # <--- 修复 vLLM 长度限制
+            teacher_config.rollout.gpu_memory_utilization = 0.5
             teacher_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.RefPolicy],
                 config=teacher_config,
@@ -246,45 +250,13 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             self.resource_pool_to_cls = {student_pool: {}, teacher_pool: {}}
 
             # 3. Initialize Student (Actor) Config
-            student_config = deepcopy(self.config.actor_rollout_ref)
-            
-            # === FIX: 显式更新 DP/TP 设置 ===
-            # 你的脚本里 tensor_model_parallel_size=1，所以我们是在增加 DP worker 数量
-            # RayWorkerGroup 会根据资源池大小自动启动对应数量的 Worker
-            # 这里不需要改 config，因为 config 传进去的是单卡配置
-            
-            student_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
-                config=student_config,
-                role="actor_rollout",
-                profile_option=self.config.trainer.npu_profile.options,
-            )
-            self.resource_pool_to_cls[student_pool]["actor_rollout"] = student_cls
-
-            # 4. Initialize Teacher (Ref) Config
-            teacher_config = deepcopy(self.config.actor_rollout_ref)
-            
-            # 针对 Teacher (1张卡) 优化显存
-            # 如果 1 张卡吃不下 256 batch，调小它的 micro_batch
-            # 注意：这里的 log_prob_micro_batch_size_per_gpu 是配置里的，
-            # 如果你原来设的是 4，现在 Teacher 只有 1 张卡，它一次处理 4 条，完全没问题。
-            # 如果 OOM，可以在这里强制改小：
-            # teacher_config.ref.log_prob_micro_batch_size_per_gpu = 2 
-            
-            teacher_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.RefPolicy],
-                config=teacher_config,
-                role="actor_rollout", 
-                profile_option=self.config.trainer.npu_profile.options,
-            )
-            self.resource_pool_to_cls[teacher_pool]["ref"] = teacher_cls
-
-            # 3. Initialize Student (Actor) Config
             # Deepcopy to prevent config pollution
             student_config = deepcopy(self.config.actor_rollout_ref)
             # Adjust micro_batch_size if necessary (optional, but good practice since world_size changed)
             # student_config.actor.ppo_mini_batch_size //= 2 # Logic handled by worker usually
-            
+            raw_max_len = self.config.data.max_prompt_length + self.config.data.max_response_length
+            safe_max_model_len = raw_max_len + 512 
+            student_config.rollout.max_model_len = safe_max_model_len # <--- 修复 vLLM 长度限制
             student_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=student_config,
@@ -296,7 +268,8 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             # 4. Initialize Teacher (Ref) Config
             # We define it as 'actor_rollout' role to FORCE vLLM initialization.
             teacher_config = deepcopy(self.config.actor_rollout_ref)
-            
+            teacher_config.rollout.max_model_len = safe_max_model_len # <--- 修复 vLLM 长度限制
+            teacher_config.rollout.gpu_memory_utilization = 0.5
             teacher_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.RefPolicy],
                 config=teacher_config,
