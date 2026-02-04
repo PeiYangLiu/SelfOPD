@@ -115,6 +115,17 @@ class TaskRunner:
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
         )
+        
+        # === NEW: Download/Copy Teacher Model (if specified) ===
+        # 我们约定在 config 中通过 +teacher.model.path 传入
+        if OmegaConf.select(config, "teacher.model.path"):
+            print(f"Preparing Teacher Model from: {config.teacher.model.path}")
+            teacher_local_path = copy_to_local(
+                config.teacher.model.path, use_shm=config.teacher.get("use_shm", False)
+            )
+            # 更新 config 中的路径为本地路径，方便后续使用
+            config.teacher.model.path = teacher_local_path
+        # =======================================================
 
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_processor, hf_tokenizer
