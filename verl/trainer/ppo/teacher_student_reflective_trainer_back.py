@@ -15,7 +15,6 @@ from verl.trainer.ppo.core_algos import AdvantageEstimator
 from verl.utils.debug import marked_timer
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import Tracking
-from verl.utils import hf_processor, hf_tokenizer
 from omegaconf import OmegaConf, open_dict
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -70,22 +69,8 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
         self.use_critic = False
         self.use_rm = False
         
-        # === NEW: Load Teacher Tokenizer ===
-        # 如果配置了 teacher.model.path，则加载对应的 tokenizer
-        # 否则默认 teacher 和 student 使用相同的 tokenizer
-        if OmegaConf.select(self.config, "teacher.model.path"):
-            print(f">>> Loading specific Teacher Tokenizer from: {self.config.teacher.model.path}")
-            self.teacher_tokenizer = hf_tokenizer(
-                self.config.teacher.model.path, 
-                trust_remote_code=self.config.data.get("trust_remote_code", False)
-            )
-            self.different_teacher_model = True
-        else:
-            print(">>> Using Student Tokenizer for Teacher (Shared Model)")
-            self.teacher_tokenizer = self.tokenizer
-            self.different_teacher_model = False
-            
         print(">>> TeacherStudentReflectiveTrainer Initialized.")
+        print(">>> Strategy: Frozen Teacher generates Summary & Scores.")
 
     def init_workers(self):
         """
@@ -95,12 +80,14 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
         n_gpus_per_node = self.config.trainer.n_gpus_per_node
         n_nodes = self.config.trainer.nnodes
         if n_nodes > 1:
-            # === Determine Teacher TP ===
-            teacher_tp = 1
-            if OmegaConf.select(self.config, "teacher.rollout.tensor_model_parallel_size"):
-                teacher_tp = self.config.teacher.rollout.tensor_model_parallel_size
-            
-            teacher_gpus_per_node = teacher_tp
+            # === 资源切分策略 (7:1) ===
+            if n_gpus_per_node >= 8:
+                teacher_gpus_per_node = 1
+            elif n_gpus_per_node >= 4:
+                teacher_gpus_per_node = 1
+            else:
+                teacher_gpus_per_node = 1 # 至少给1张
+                
             student_gpus_per_node = n_gpus_per_node - teacher_gpus_per_node
             
             if student_gpus_per_node < 1:
@@ -176,32 +163,20 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             self.resource_pool_to_cls[student_pool]["actor_rollout"] = student_cls
 
             teacher_config = deepcopy(self.config.actor_rollout_ref)
-            # === NEW: Override Teacher Config ===
-            if self.different_teacher_model:
-                teacher_config.model.path = self.config.teacher.model.path
-                print(f">>> [Config] Overriding Teacher Model Path: {teacher_config.model.path}")
-                
-                # 如果配置了特定的 Tensor Parallel Size (因为 Teacher 可能很大)
-                if OmegaConf.select(self.config, "teacher.rollout.tensor_model_parallel_size"):
-                    tp_size = self.config.teacher.rollout.tensor_model_parallel_size
-                    teacher_config.rollout.tensor_model_parallel_size = tp_size
-                    print(f">>> [Config] Overriding Teacher TP Size: {tp_size}")
-                    
-                # 如果配置了特定的 GPU Memory Utilization
-                if OmegaConf.select(self.config, "teacher.rollout.gpu_memory_utilization"):
-                    gpu_mem = self.config.teacher.rollout.gpu_memory_utilization
-                    teacher_config.rollout.gpu_memory_utilization = gpu_mem
-            else:
-                # 默认配置
-                teacher_config.rollout.gpu_memory_utilization = 0.5
-                
-            teacher_config.model.torch_dtype = "bfloat16"
-            teacher_config.rollout.max_model_len = safe_max_model_len
+            # === FIX: 调整 Teacher vLLM 显存 ===
+            # 之前设为 0.2 导致 8k 长度下 vLLM 无法初始化 KV Cache。
+            # 现在设为 0.5 (给 vLLM 50%，留 50% 给 PyTorch Forward)
+            # 配合 torch_dtype=bfloat16，这应该是够用的。
+            teacher_config.rollout.gpu_memory_utilization = 0.5 
             
+            # 确保 Teacher 也是 bf16 (如果 config 里没传)
+            teacher_config.model.torch_dtype = "bfloat16" 
+            teacher_config.rollout.max_model_len = safe_max_model_len # <--- 修复 vLLM 长度限制
+            teacher_config.rollout.gpu_memory_utilization = 0.5
             teacher_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.RefPolicy],
                 config=teacher_config,
-                role="actor_rollout", # Force vLLM
+                role="actor_rollout",
                 profile_option=self.config.trainer.npu_profile.options,
             )
             self.resource_pool_to_cls[teacher_pool]["ref"] = teacher_cls
@@ -242,30 +217,31 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             # 之前的逻辑: student_gpus = n_gpus_per_node // 2 (4:4)
             # 新的逻辑: 尽可能多给 Student，Teacher 保留 1-2 张即可
             
-            # === Determine Teacher TP ===
-            teacher_tp = 1
-            if OmegaConf.select(self.config, "teacher.rollout.tensor_model_parallel_size"):
-                teacher_tp = self.config.teacher.rollout.tensor_model_parallel_size
+            if n_gpus_per_node >= 8:
+                teacher_gpus = 1  # 8卡机器：7 Student : 1 Teacher
+            elif n_gpus_per_node >= 4:
+                teacher_gpus = 1  # 4卡机器：3 Student : 1 Teacher
+            else:
+                teacher_gpus = 1  # 至少给1张
+                
+            student_gpus = n_gpus_per_node - teacher_gpus
             
-            teacher_gpus_per_node = teacher_tp
-            student_gpus_per_node = n_gpus_per_node - teacher_gpus_per_node
-            
-            if teacher_gpus_per_node < 1:
+            if student_gpus < 1:
                 raise ValueError(f"Not enough GPUs! Need at least 2 GPUs per node.")
                 
-            print(f">>> Resource Splitting: Student={student_gpus_per_node} GPUs, Teacher={teacher_gpus_per_node} GPUs (per node)")
+            print(f">>> Resource Splitting: Student={student_gpus} GPUs, Teacher={teacher_gpus} GPUs (per node)")
             # =========================
 
             # 2. Create Independent Resource Pools
             student_pool = RayResourcePool(
-                process_on_nodes=[student_gpus_per_node] * n_nodes,
+                process_on_nodes=[student_gpus] * n_nodes,
                 use_gpu=True,
                 max_colocate_count=1,
                 name_prefix="student_pool"
             )
             
             teacher_pool = RayResourcePool(
-                process_on_nodes=[teacher_gpus_per_node] * n_nodes,
+                process_on_nodes=[teacher_gpus] * n_nodes,
                 use_gpu=True,
                 max_colocate_count=1,
                 name_prefix="teacher_pool"
@@ -292,32 +268,12 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             # 4. Initialize Teacher (Ref) Config
             # We define it as 'actor_rollout' role to FORCE vLLM initialization.
             teacher_config = deepcopy(self.config.actor_rollout_ref)
-            # === NEW: Override Teacher Config ===
-            if self.different_teacher_model:
-                teacher_config.model.path = self.config.teacher.model.path
-                print(f">>> [Config] Overriding Teacher Model Path: {teacher_config.model.path}")
-                
-                # 如果配置了特定的 Tensor Parallel Size (因为 Teacher 可能很大)
-                if OmegaConf.select(self.config, "teacher.rollout.tensor_model_parallel_size"):
-                    tp_size = self.config.teacher.rollout.tensor_model_parallel_size
-                    teacher_config.rollout.tensor_model_parallel_size = tp_size
-                    print(f">>> [Config] Overriding Teacher TP Size: {tp_size}")
-                    
-                # 如果配置了特定的 GPU Memory Utilization
-                if OmegaConf.select(self.config, "teacher.rollout.gpu_memory_utilization"):
-                    gpu_mem = self.config.teacher.rollout.gpu_memory_utilization
-                    teacher_config.rollout.gpu_memory_utilization = gpu_mem
-            else:
-                # 默认配置
-                teacher_config.rollout.gpu_memory_utilization = 0.5
-                
-            teacher_config.model.torch_dtype = "bfloat16"
-            teacher_config.rollout.max_model_len = safe_max_model_len
-            
+            teacher_config.rollout.max_model_len = safe_max_model_len # <--- 修复 vLLM 长度限制
+            teacher_config.rollout.gpu_memory_utilization = 0.5
             teacher_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.RefPolicy],
                 config=teacher_config,
-                role="actor_rollout", # Force vLLM
+                role="actor_rollout", # <--- Hack: Pretend to be Actor to enable vLLM
                 profile_option=self.config.trainer.npu_profile.options,
             )
             self.resource_pool_to_cls[teacher_pool]["ref"] = teacher_cls
@@ -428,8 +384,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 {"role": "user", "content": content}
             ]
 
-            # 4. 编码 (使用 Teacher Tokenizer)
-            enc_ids = self.teacher_tokenizer.apply_chat_template(
+            enc_ids = self.tokenizer.apply_chat_template(
                 messages, 
                 tokenize=True, 
                 add_generation_prompt=True,
@@ -442,18 +397,17 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             input_ids_list.append(enc_ids)
             attention_mask_list.append(torch.ones_like(enc_ids))
 
-        # --- Padding (使用 Teacher Tokenizer 的 Pad ID) ---
+        # --- Manual Left Padding & Position IDs ---
         max_len = max([len(t) for t in input_ids_list])
-        pad_token_id = self.teacher_tokenizer.pad_token_id # Important!
-        if pad_token_id is None:
-            pad_token_id = self.teacher_tokenizer.eos_token_id
-
+        pad_token_id = self.tokenizer.pad_token_id
+        
         padded_input_ids = []
         padded_attention_mask = []
         padded_position_ids = []
         
         for ids, mask in zip(input_ids_list, attention_mask_list):
             pad_len = max_len - len(ids)
+            
             pad_ids = torch.full((pad_len,), pad_token_id, dtype=ids.dtype, device=ids.device)
             pad_mask = torch.full((pad_len,), 0, dtype=mask.dtype, device=mask.device)
             
@@ -467,6 +421,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             pos_content = torch.arange(seq_len, dtype=torch.long, device=ids.device)
             pos_pad = torch.zeros(pad_len, dtype=torch.long, device=ids.device)
             final_pos = torch.cat([pos_pad, pos_content])
+            
             padded_position_ids.append(final_pos)
             
         input_ids = torch.stack(padded_input_ids)
@@ -499,11 +454,11 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
 
         summary_batch.meta_info = {
             "do_sample": True,
-            "temperature": 0.1,
-            "max_new_tokens": max_tokens,
-            "eos_token_id": self.teacher_tokenizer.eos_token_id, # Teacher EOS
-            "pad_token_id": self.teacher_tokenizer.pad_token_id, # Teacher Pad
-            "ignore_eos": False,
+            "temperature": 0.1,  # 低温有助于逻辑连贯
+            "max_new_tokens": max_tokens, # <--- 确保这里是大数值
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "ignore_eos": False, # 允许模型自己决定何时结束
         }
         
         return summary_batch
@@ -544,11 +499,10 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 p_text_clean = p_text_clean.replace("<|im_end|>", "")
             p_text_clean = p_text_clean.strip()
 
-            # 2. 获取 Summary (Teacher Tokenizer -> Text)
-            # Summaries 是 Teacher 生成的，所以用 teacher_tokenizer 解码
+            # 2. 获取 Summary 并清洗
             s_ids = summaries[i]
-            s_ids = s_ids[s_ids != self.teacher_tokenizer.pad_token_id]
-            s_text = self.teacher_tokenizer.decode(s_ids, skip_special_tokens=True)
+            s_ids = s_ids[s_ids != self.tokenizer.pad_token_id]
+            s_text = self.tokenizer.decode(s_ids, skip_special_tokens=True)
             
             if "####" in s_text:
                 s_text = s_text.split("####")[0].strip()
@@ -557,7 +511,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             # 3. 获取 Student Response
             r_ids = responses[i]
             r_ids = r_ids[r_ids != self.tokenizer.pad_token_id]
-            # r_text = self.tokenizer.decode(r_ids, skip_special_tokens=True)
+
             # 获取 GT
             gt_text = ground_truths[i]
 
@@ -576,26 +530,19 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 f"{gt_text}\n\n"
                 "Instruction: Solve the problem step-by-step. Do not just state the answer."
             )
-            # 5. 编码 Prompt (Teacher Tokenizer)
             messages = [
                 {"role": "system", "content": system_content}, 
                 {"role": "user", "content": user_content},
                 {"role": "user", "content": p_text_clean} 
             ]
             
-            prefix_ids = self.teacher_tokenizer.apply_chat_template(
+            # 5. Chat Template
+            prefix_ids = self.tokenizer.apply_chat_template(
                 messages, 
                 tokenize=True, 
                 add_generation_prompt=True,
                 return_tensors='pt'
             )[0].to(r_ids.device)
-            # r_text_for_teacher = " " + r_text
-            # 6. 编码 Student Response (Teacher Tokenizer)
-            # 注意：这里我们重新编码 Student Response，因为 Teacher 的词表可能不同
-            # 为了计算 LogProb，我们需要 Teacher 认为这段 Response 的 Token ID 是什么
-            # 通常不需要 add_special_tokens=False，因为这是接在 prompt 后面的
-            # 但是 vLLM/HF 通常会自动处理，这里我们直接 encode 文本
-            # r_ids_teacher = self.teacher_tokenizer.encode(r_text_for_teacher, add_special_tokens=False, return_tensors='pt')[0].to(r_ids.device)
             
             # 6. 拼接 (此时不加 Mask，放到后面统一处理)
             teacher_full = torch.cat([prefix_ids, r_ids])
@@ -605,10 +552,8 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             new_responses_list.append(r_ids)
 
         # === 核心修正: 手动 Left Padding (Input 和 Labels 双向对齐) ===
-        # === Padding (Teacher Tokenizer) ===
         device = batch.batch['input_ids'].device
-        pad_token_id = self.teacher_tokenizer.pad_token_id
-        if pad_token_id is None: pad_token_id = self.teacher_tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id
         
         # 1. 计算最大长度
         max_len_input = max([x.size(0) for x in new_input_ids])
@@ -709,9 +654,9 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
         test_prompts = ["1+1="]
         test_responses = ["2"]
         
-        # 使用 Teacher Tokenizer 编码
-        p_ids = self.teacher_tokenizer.encode(test_prompts[0], return_tensors='pt')[0]
-        r_ids = self.teacher_tokenizer.encode(test_responses[0], return_tensors='pt')[0]
+        # 1. 构造单个样本
+        p_ids = self.tokenizer.encode(test_prompts[0], return_tensors='pt')[0]
+        r_ids = self.tokenizer.encode(test_responses[0], return_tensors='pt')[0]
         
         input_ids = torch.cat([p_ids, r_ids])
         attention_mask = torch.ones_like(input_ids)
