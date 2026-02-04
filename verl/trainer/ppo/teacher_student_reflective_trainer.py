@@ -519,16 +519,20 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             system_content = (
                 "You are a helpful math assistant.\n"
                 "I will provide a reference analysis (Hint) below. "
-                "Please use this hint to help you solve the user's problem step-by-step.\n\n"
+                "I will also provide the ground truth (GT) below. "
+                "The hint may be fault and the ground truth is always correct. "
+                "Please use this ground truth and hint to help you solve the user's problem step-by-step.\n\n"
+            )
+            user_content = (
                 "Reference Analysis/Hint:\n"
                 f"{s_text}\n\n"
                 "Standard Solution (Ground Truth):\n" 
                 f"{gt_text}\n\n"
                 "Instruction: Solve the problem step-by-step. Do not just state the answer."
             )
-
             messages = [
                 {"role": "system", "content": system_content}, 
+                {"role": "user", "content": user_content},
                 {"role": "user", "content": p_text_clean} 
             ]
             
