@@ -856,9 +856,13 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     summaries = summary_output.batch['responses']
                     
                     # 3.4 Teacher Computes LogProb
-                    teacher_batch = self._prepare_teacher_forward_batch(batch, summaries, current_ground_truths)
-                    teacher_log_prob_output = self.ref_policy_wg.compute_log_prob(teacher_batch)
-                    teacher_full_log_probs = teacher_log_prob_output.batch['old_log_probs']
+                    # === FIX: 改用 compute_ref_log_prob 以避免计算 Entropy 导致 OOM ===
+                    # 原代码: teacher_log_prob_output = self.ref_policy_wg.compute_log_prob(teacher_batch)
+                    # 原代码: teacher_full_log_probs = teacher_log_prob_output.batch['old_log_probs']
+                    
+                    # 新代码:
+                    teacher_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(teacher_batch)
+                    teacher_full_log_probs = teacher_log_prob_output.batch['ref_log_prob'] # 注意 Key 变成了 ref_log_prob
                     
                     # === FIX: 将 Teacher 的 LogProbs 从 Left Pad 转为 Right Pad ===
                     # 这里的 teacher_batch['response_mask'] 是 Left Padded 的，正好用来提取有效 LogProbs
