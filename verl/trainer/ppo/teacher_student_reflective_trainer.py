@@ -181,27 +181,25 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 teacher_config.model.path = self.config.teacher.model.path
                 print(f">>> [Config] Overriding Teacher Model Path: {teacher_config.model.path}")
                 
-                # 如果配置了特定的 Tensor Parallel Size (因为 Teacher 可能很大)
-                if OmegaConf.select(self.config, "teacher.rollout.tensor_model_parallel_size"):
-                    tp_size = self.config.teacher.rollout.tensor_model_parallel_size
-                    teacher_config.rollout.tensor_model_parallel_size = tp_size
-                    print(f">>> [Config] Overriding Teacher TP Size: {tp_size}")
-                    
-                # 如果配置了特定的 GPU Memory Utilization
-                if OmegaConf.select(self.config, "teacher.rollout.gpu_memory_utilization"):
-                    gpu_mem = self.config.teacher.rollout.gpu_memory_utilization
-                    teacher_config.rollout.gpu_memory_utilization = gpu_mem
-            else:
-                # 默认配置
-                teacher_config.rollout.gpu_memory_utilization = 0.5
+                # 只有 Megatron 需要 TP，FSDP 通常不需要手动设置 TP，除非你用的是 Megatron 后端
+                # 但如果你的 Teacher 很大 (比如 72B)，可能需要 FSDP Sharding
+                # 注意：标准的 RefWorker (FSDP) 会自动处理 Sharding
                 
-            teacher_config.model.torch_dtype = "bfloat16"
-            teacher_config.rollout.max_model_len = safe_max_model_len
+                # 移除 vLLM 特有的配置，防止报错或误导
+                if 'rollout' in teacher_config:
+                    # 纯 Ref 不需要 gpu_memory_utilization，因为它不用 vLLM
+                    # 但保留它也无妨，只要 role="ref"，这些参数通常会被忽略
+                    pass
             
+            teacher_config.model.torch_dtype = "bfloat16"
+            
+            # === KEY CHANGE: 这里的 role 改回 "ref" ===
+            # 这告诉 verl 使用 ActorRolloutRefWorker 的 ref_model 逻辑，而不是 actor 逻辑
+            # 并且不会初始化 vLLM
             teacher_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.RefPolicy],
                 config=teacher_config,
-                role="actor_rollout", # Force vLLM
+                role="ref",  # <--- 改回 ref
                 profile_option=self.config.trainer.npu_profile.options,
             )
             self.resource_pool_to_cls[teacher_pool]["ref"] = teacher_cls
@@ -297,27 +295,25 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 teacher_config.model.path = self.config.teacher.model.path
                 print(f">>> [Config] Overriding Teacher Model Path: {teacher_config.model.path}")
                 
-                # 如果配置了特定的 Tensor Parallel Size (因为 Teacher 可能很大)
-                if OmegaConf.select(self.config, "teacher.rollout.tensor_model_parallel_size"):
-                    tp_size = self.config.teacher.rollout.tensor_model_parallel_size
-                    teacher_config.rollout.tensor_model_parallel_size = tp_size
-                    print(f">>> [Config] Overriding Teacher TP Size: {tp_size}")
-                    
-                # 如果配置了特定的 GPU Memory Utilization
-                if OmegaConf.select(self.config, "teacher.rollout.gpu_memory_utilization"):
-                    gpu_mem = self.config.teacher.rollout.gpu_memory_utilization
-                    teacher_config.rollout.gpu_memory_utilization = gpu_mem
-            else:
-                # 默认配置
-                teacher_config.rollout.gpu_memory_utilization = 0.5
+                # 只有 Megatron 需要 TP，FSDP 通常不需要手动设置 TP，除非你用的是 Megatron 后端
+                # 但如果你的 Teacher 很大 (比如 72B)，可能需要 FSDP Sharding
+                # 注意：标准的 RefWorker (FSDP) 会自动处理 Sharding
                 
-            teacher_config.model.torch_dtype = "bfloat16"
-            teacher_config.rollout.max_model_len = safe_max_model_len
+                # 移除 vLLM 特有的配置，防止报错或误导
+                if 'rollout' in teacher_config:
+                    # 纯 Ref 不需要 gpu_memory_utilization，因为它不用 vLLM
+                    # 但保留它也无妨，只要 role="ref"，这些参数通常会被忽略
+                    pass
             
+            teacher_config.model.torch_dtype = "bfloat16"
+            
+            # === KEY CHANGE: 这里的 role 改回 "ref" ===
+            # 这告诉 verl 使用 ActorRolloutRefWorker 的 ref_model 逻辑，而不是 actor 逻辑
+            # 并且不会初始化 vLLM
             teacher_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.RefPolicy],
                 config=teacher_config,
-                role="actor_rollout", # Force vLLM
+                role="ref",  # <--- 改回 ref
                 profile_option=self.config.trainer.npu_profile.options,
             )
             self.resource_pool_to_cls[teacher_pool]["ref"] = teacher_cls
@@ -753,10 +749,10 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
         }
         
         # Teacher Forward
-        out = self.ref_policy_wg.compute_log_prob(sanity_batch)
+        out = self.ref_policy_wg.compute_ref_log_prob(sanity_batch)
         
         # 取第一个样本的结果
-        log_prob = out.batch['old_log_probs'][0, 0].item() 
+        log_prob = out.batch['ref_log_prob'][0, 0].item()
         
         print(f"Teacher Sanity Check: LogProb('2' | '1+1=') = {log_prob:.4f}")
         
@@ -845,7 +841,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     else:
                         current_ground_truths = [""] * len(tensor_prompts)
 
-                    # 3.3 Teacher Generates Summary
+                    # 3.3 Student Generates Summary
                     summary_input_batch = self._prepare_summary_generation_batch(
                         batch, 
                         decoded_prompts, 

@@ -19,7 +19,6 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_self_reflective \
  +data.summary_max_new_tokens=1024 \
  +teacher.model.path=$TEACHER_MODEL \
  +teacher.rollout.tensor_model_parallel_size=1 \
- +teacher.rollout.gpu_memory_utilization=0.8 \
  actor_rollout_ref.model.path=$BASE_MODEL \
  +actor_rollout_ref.model.torch_dtype=bfloat16 \
  actor_rollout_ref.actor.optim.lr=5e-7 \
