@@ -107,8 +107,8 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 raise ValueError(f"Not enough GPUs per node! Got {n_gpus_per_node}, need at least 2.")
 
             # 计算总的 World Size
-            student_world_size = student_gpus_per_node * n_nodes
-            teacher_world_size = teacher_gpus_per_node * n_nodes
+            student_world_size = student_gpus_per_node * n_nodes / self.config.teacher.rollout.tensor_model_parallel_size
+            teacher_world_size = teacher_gpus_per_node * n_nodes / teacher_tp
             
             print(f"\n{'='*20} Multi-Node Topology Setup {'='*20}")
             print(f">>> Nodes: {n_nodes} | GPUs per Node: {n_gpus_per_node}")
