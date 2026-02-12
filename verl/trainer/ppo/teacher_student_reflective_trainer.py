@@ -766,7 +766,32 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
+
                 timing_raw = {}
+
+                is_last_step = self.global_steps >= self.total_training_steps
+
+                if (
+                    self.val_reward_fn is not None
+                    and self.config.trainer.test_freq > 0
+                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0 or self.global_steps == 1)
+                ):
+                    print(f"Start Testing at step {self.global_steps}...")
+                    with marked_timer("testing", timing_raw, color="green"):
+                        # 调用父类 RayPPOTrainer 的 _validate 方法
+                        # 它会使用 Student (Actor) 在验证集上生成，并计算 Ground Truth Accuracy
+                        val_metrics: dict = self._validate() 
+                    
+                    # 将测试指标添加到 metrics 中，以便 logger 记录
+                    metrics.update(val_metrics)
+                    print(f"Testing finished. Metrics: {val_metrics}")
+                # =================================================================
+
+                metrics.update({
+                    "training/global_step": self.global_steps,
+                    "training/epoch": epoch
+                })
+                
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 
@@ -1155,30 +1180,6 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 # 1. 存在验证集 Reward Function
                 # 2. test_freq 设置大于 0
                 # 3. 步数整除 OR 是最后一步
-                
-                is_last_step = self.global_steps >= self.total_training_steps
-
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0 or self.global_steps == 1)
-                ):
-                    print(f"Start Testing at step {self.global_steps}...")
-                    with marked_timer("testing", timing_raw, color="green"):
-                        # 调用父类 RayPPOTrainer 的 _validate 方法
-                        # 它会使用 Student (Actor) 在验证集上生成，并计算 Ground Truth Accuracy
-                        val_metrics: dict = self._validate() 
-                    
-                    # 将测试指标添加到 metrics 中，以便 logger 记录
-                    metrics.update(val_metrics)
-                    print(f"Testing finished. Metrics: {val_metrics}")
-                # =================================================================
-
-                metrics.update({
-                    "training/global_step": self.global_steps,
-                    "training/epoch": epoch
-                })
-                
                 logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)
                 self.global_steps += 1
