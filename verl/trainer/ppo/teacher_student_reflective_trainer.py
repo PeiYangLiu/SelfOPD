@@ -875,10 +875,15 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     teacher_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(teacher_batch)
                     teacher_full_log_probs = teacher_log_prob_output.batch['ref_log_prob']
                     
+                    # === 新增: 获取 Teacher 的 Argmax Token ID ===
+                    # 注意：如果 dp_actor 没改好，这里会报错 KeyError
+                    teacher_full_argmax = teacher_log_prob_output.batch['ref_argmax'] 
+
                     # === FIX: 将 Teacher 的 LogProbs 从 Left Pad 转为 Right Pad ===
                     t_resp_mask = teacher_batch.batch['response_mask']
                     teacher_full_log_probs_aligned = left_to_right_padding(teacher_full_log_probs, t_resp_mask)
-                    
+                    teacher_full_argmax_aligned = left_to_right_padding(teacher_full_argmax, t_resp_mask) # <--- 对齐 Argmax
+
                     # === 核心修改: 将对齐后的 Teacher LogProb 存入 batch，作为 K2 Loss 的 Target ===
                     batch.batch['ref_log_prob'] = teacher_full_log_probs_aligned
                     
@@ -1033,16 +1038,106 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     # === FIX: Add Debug Metrics (Logits Statistics) ===
                     # =================================================================
                     with torch.no_grad():
+                        # 1. 获取有效 Mask (切片以匹配 min_len)
+                        # 必须过滤掉 Padding，否则 Min LogP 会显示 -14.82 (Padding 的 LogP)
                         valid_mask = batch.batch['response_mask'][:, :min_len].bool()
+                        
                         if valid_mask.any():
+                            # 2. 提取有效数据 (Flatten)
                             s_valid = s_part[valid_mask]
                             t_valid = t_part[valid_mask]
                             diff_valid = kl_diff[valid_mask]
                             
+                            # 3. Student Stats
+                            metrics['debug/student_logp_max'] = s_valid.max().item()
+                            metrics['debug/student_logp_min'] = s_valid.min().item()
                             metrics['debug/student_logp_mean'] = s_valid.mean().item()
+                            
+                            # 4. Teacher Stats
+                            metrics['debug/teacher_logp_max'] = t_valid.max().item()
+                            metrics['debug/teacher_logp_min'] = t_valid.min().item()
                             metrics['debug/teacher_logp_mean'] = t_valid.mean().item()
+                            
+                            # 5. Diff Stats (Reward Raw)
+                            metrics['debug/diff_logp_max'] = diff_valid.max().item()
+                            metrics['debug/diff_logp_min'] = diff_valid.min().item()
                             metrics['debug/diff_logp_mean'] = diff_valid.mean().item()
+                            
+                            # 6. (可选) 监控 Teacher 是否过于自信
+                            # 如果 Teacher LogP 经常接近 0 (Max ~ 0)，说明 Teacher 非常确信
+                            # 如果 Diff Max 很大 (e.g. > 5.0)，说明 Teacher 觉得 Student 错得离谱
+                    # =================================================================
 
+                    # === Log Part 2: Token-Level KL Analysis ===
+                    if True:
+                        print(f"\n{'='*20} Token-Level KL Analysis (Step {self.global_steps}) {'='*20}")
+                        try:
+                            idx = 0 
+                            # 1. Student Response (Remove Pad)
+                            s_ids = batch.batch['responses'][idx]
+                            s_ids = s_ids[s_ids != self.tokenizer.pad_token_id]
+                            
+                            # 2. Teacher Response (Extract using Mask)
+                            t_full_ids = teacher_batch.batch['input_ids'][idx]
+                            t_mask = teacher_batch.batch['response_mask'][idx]
+                            t_ids = t_full_ids[t_mask.bool()]
+                            t_ids = t_ids[t_ids != self.tokenizer.pad_token_id]
+                            
+                            # 3. Decode
+                            s_text_check = self.tokenizer.decode(s_ids, skip_special_tokens=False)
+                            t_text_check = self.tokenizer.decode(t_ids, skip_special_tokens=False)
+                            
+                            print(f"--- Sequence Alignment Check ---")
+
+                            
+                            if len(s_ids) != len(t_ids) or not torch.equal(s_ids, t_ids):
+                                print("[WARNING] ID Mismatch! Teacher sees different tokens than Student generated!")
+                                print(f"S IDs: {s_ids.tolist()}")
+                                print(f"T IDs: {t_ids.tolist()}")
+                                print(f"Student Seq (Len={len(s_ids)}): {s_text_check}...")
+                                print(f"Teacher Seq (Len={len(t_ids)}): {t_text_check}...")
+                            else:
+                                print("[OK] Token IDs match perfectly.")
+
+                            print(f"\n--- Token-wise KL Breakdown ---")
+                            print(f"{'Token':<15} | {'ID':<6} | {'S_LogP':<8} | {'T_LogP':<8} | {'Diff':<8} | {'Teacher Preferred'}")
+                            print("-" * 95)
+                            s_vals = s_part[idx].tolist()
+                            t_vals = t_part[idx].tolist() # 这里引用的 t_part 已经是 Right Padded 的了
+                            diff_vals = kl_diff[idx].tolist()
+                            # 获取当前样本的 Teacher Preferred Tokens
+                            t_preferred_ids = teacher_full_argmax_aligned[idx].tolist()
+                            valid_count = 0
+                            for i in range(len(s_ids)):
+                                # if valid_count >= 50: break
+                                if i >= len(s_vals): break
+                                
+                                tid = s_ids[i].item()
+                                token_str = self.tokenizer.decode([tid]).replace('\n', '\\n')
+                                                                # 获取 Teacher 想要什么
+                                t_pref_id = t_preferred_ids[i]
+                                # 如果是 Padding (0)，显示为 Pad
+                                if i >= len(t_ids): # 简单的越界保护
+                                    t_pref_str = "[PAD]"
+                                else:
+                                    t_pref_str = self.tokenizer.decode([t_pref_id]).replace('\n', '\\n').strip()
+                                diff_val = diff_vals[i]
+                                
+                                # 格式化输出
+                                row_str = f"{token_str:<15} | {tid:<6} | {s_vals[i]:.2f}   | {t_vals[i]:.2f}   | {diff_val:.2f}   "
+                                
+                                if np.abs(diff_val) < 0.1:
+                                    print(f"{row_str} | {t_pref_str}")
+                                else:
+                                    # 差异大时，高亮显示 Teacher 想要的 Token
+                                    print(f"{row_str} | >> {t_pref_str} <<")
+                                valid_count += 1
+                                
+                        except Exception as e:
+                            print(f"Log Error 2: {e}")
+                        print(f"{'='*60}\n")
+                    # ==========================================
+                    
                     # 记录 diff 到 reward 以便 tensorboard 观察，但不截断
                     token_level_rewards[:, :min_len] = kl_diff
                     batch.batch['token_level_rewards'] = token_level_rewards

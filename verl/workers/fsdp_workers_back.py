@@ -779,20 +779,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
-                output, entropys, argmax_ids = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-            
-            # === 修改: 显式打包 ===
-            tensors = {
-                "old_log_probs": output, 
-                "entropys": entropys,
-                "ref_argmax": argmax_ids  # 直接放入
-            }
+                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
             output = DataProto.from_dict(
-                tensors=tensors,
+                tensors={"old_log_probs": output, "entropys": entropys},
                 meta_info={"temperature": self.config.rollout.temperature},
             )
-            # === 修改结束 ===
-            
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")
@@ -815,14 +806,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
             data = self.compute_log_prob(data)
-            
-            # === 修改: LoRA 模式下传递 ref_argmax ===
-            tensors = {"ref_log_prob": data.batch["old_log_probs"]}
-            if "ref_argmax" in data.batch:
-                tensors["ref_argmax"] = data.batch["ref_argmax"]
-            data = DataProto.from_dict(tensors=tensors)
+            # this old_log_probs is in fact ref_log_prob
+            data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
             return data
-            
         assert self._is_ref
         # else:
         # otherwise, the class have a standalone ref model
@@ -836,17 +822,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output, _, argmax_ids = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            
-            # === 修改: 显式打包 ===
-            tensors = {
-                "ref_log_prob": output,
-                "ref_argmax": argmax_ids # 直接放入
-            }
-            
-            output = DataProto.from_dict(tensors=tensors)
-            # === 修改结束 ===
-            
+            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            output = DataProto.from_dict(tensors={"ref_log_prob": output})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")
