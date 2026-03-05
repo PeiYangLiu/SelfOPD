@@ -84,6 +84,7 @@ class DataParallelPPOActor(BasePPOActor):
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            argmax_ids: # (bs, response_len) <--- 新增
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -174,11 +175,16 @@ class DataParallelPPOActor(BasePPOActor):
                 )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
-                    log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
-                    entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
-
+                    # 如果用了 Fused Kernel，通常拿不到 Logits，这里只能给个占位符或者报错
+                    # 建议 Debug 时关闭 use_fused_kernels
+                    log_probs = output.log_probs.squeeze(0)
+                    entropy_rmpad = output.entropy.squeeze(0)
+                    argmax_rmpad = torch.zeros_like(log_probs, dtype=torch.long) # 无法获取
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+                    # === 新增: 计算 Argmax ===
+                    # input_ids_rmpad_rolled 是 label，对应 logits_rmpad
+                    argmax_rmpad = torch.argmax(logits_rmpad, dim=-1) # (total_nnz,)
                     logits_rmpad.div_(temperature)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
@@ -230,12 +236,18 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
-
+                # Pad back argmax
+                full_argmax = pad_input(
+                    hidden_states=argmax_rmpad.unsqueeze(-1),
+                    indices=indices,
+                    batch=batch_size,
+                    seqlen=seqlen,
+                )
                 # only return response part:
                 if calculate_entropy:
                     entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
-
+                argmax_ids = full_argmax.squeeze(-1)[:, -response_length - 1 : -1] # <--- 新增
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
                 if self.use_fused_kernels:
@@ -254,10 +266,15 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
-
+                    argmax_ids = torch.zeros_like(log_probs, dtype=torch.long) # 无法获取
                 else:
                     logits = output.logits
-
+                    # === 新增: 计算 Argmax ===
+                    # Shift logic: logits 预测的是下一个 token
+                    # logits shape: (bsz, seq_len, vocab)
+                    # 我们取 response 部分对应的 logits
+                    logits_resp = logits[:, -response_length - 1 : -1, :] 
+                    argmax_ids = torch.argmax(logits_resp, dim=-1) # (bsz, response_length)
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
@@ -267,7 +284,7 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            return entropy, log_probs
+            return entropy, log_probs, argmax_ids
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -310,27 +327,35 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        argmax_lst = [] # <--- 新增
         for micro_batch in micro_batches:
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
+                # 接收三个返回值
+                entropy, log_probs, argmax_ids = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                 )
             log_probs_lst.append(log_probs)
+            argmax_lst.append(argmax_ids) # <---
             if calculate_entropy:
                 entropy_lst.append(entropy)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
+        argmax_ids = torch.concat(argmax_lst, dim=0) # <---
         entropys = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
+            argmax_ids = restore_dynamic_batch(argmax_ids, batch_idx_list) # <---
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
-
-        return log_probs, entropys
+        # 将 argmax 塞回 data.batch 中返回
+        # 注意：这里我们修改了 DataProto 的内容
+        # compute_ref_log_prob 会返回这个 data 对象
+        data.batch['ref_argmax'] = argmax_ids
+        return log_probs, entropys, argmax_ids
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -350,7 +375,8 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-
+        if "ref_log_prob" not in select_keys:
+            select_keys.append("ref_log_prob")
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -394,10 +420,12 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
+                    entropy, log_prob, _ = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
-
+                    # 获取 Teacher 的 log_prob (从 batch 里拿)
+                    ref_log_prob = model_inputs["ref_log_prob"]
+                    response_mask = model_inputs["response_mask"]
                     # =========================================================================
                     # 修复: 健壮地读取 loss_mode
                     # =========================================================================
@@ -406,19 +434,26 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-                    # =========================================================================
-                    # 新增: distillation 模式 (Pure Policy Gradient / No Clipping)
-                    # =========================================================================
+                    # =========================================================
+                    # 【核心修改】实现 K2 Loss (MSE Regression)
+                    # =========================================================
                     if loss_mode == "distillation":
-                        # 直接最大化 (advantages * log_prob)
-                        # 我们假设 advantages 已经包含了 (log P_T - log P_S) 的信号
-                        # 这是一个无偏的 KL 散度梯度估计
-                        pg_loss = -verl_F.masked_mean(advantages * log_prob, response_mask)
+                        # 公式: L = 0.5 * (log_P_Student - log_P_Teacher)^2
+                        # 这是一个回归 Loss，Beta=1
                         
-                        # 占位符，避免日志报错
-                        pg_clipfrac = torch.tensor(0.0, device=pg_loss.device)
-                        ppo_kl = torch.tensor(0.0, device=pg_loss.device)
-                        pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+                        diff = log_prob - ref_log_prob
+                        
+                        # MSE Loss
+                        k2_loss = 0.5 * (diff ** 2)
+                        
+                        # 只计算有效 Token 的 Loss
+                        policy_loss = verl_F.masked_mean(k2_loss, response_mask)
+                        
+                        # 记录 Log 用于调试
+                        pg_loss = policy_loss # 借用变量名方便 Log
+                        pg_clipfrac = torch.tensor(0.0)
+                        ppo_kl = diff.mean() # 记录一下平均差异
+                        pg_clipfrac_lower = torch.tensor(0.0)
 
                     elif loss_mode == "vanilla":
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(

@@ -725,11 +725,6 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
         position_ids = position_ids.unsqueeze(0).repeat(world_size, 1)
         response_mask = response_mask.unsqueeze(0).repeat(world_size, 1)
         
-        # Prompts 和 Responses 在 DataProto 中主要是占位，但也需要对齐
-        # 注意：DataProto.from_dict 对 tensor 的处理比较严格，这里我们只放必要的 keys
-        # 为了避免复杂，我们只放 input_ids 等核心 tensor，prompts/responses 可以留空或者也 repeat
-        # compute_log_prob 主要依赖 input_ids, attention_mask, position_ids, responses(用于mask)
-        
         # 重新构造 responses (tensor)
         responses_tensor = r_ids.unsqueeze(0).repeat(world_size, 1)
 
@@ -758,7 +753,6 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
         
         if log_prob < -5.0:
             print("!!! CRITICAL WARNING: Teacher LogProb is extremely low. Model might be randomly initialized!")
-            # raise RuntimeError("Teacher Model is broken!")
         else:
             print("Teacher seems healthy.")
         # ============================================
@@ -779,7 +773,6 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     print(f"Start Testing at step {self.global_steps}...")
                     with marked_timer("testing", timing_raw, color="green"):
                         # 调用父类 RayPPOTrainer 的 _validate 方法
-                        # 它会使用 Student (Actor) 在验证集上生成，并计算 Ground Truth Accuracy
                         val_metrics: dict = self._validate() 
                     
                     # 将测试指标添加到 metrics 中，以便 logger 记录
@@ -878,33 +871,28 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     
                     # 3.4 Teacher Computes LogProb
                     teacher_batch = self._prepare_teacher_forward_batch(batch, summaries, current_ground_truths)
-                    # 3.4 Teacher Computes LogProb
-                    # === FIX: 改用 compute_ref_log_prob 以避免计算 Entropy 导致 OOM ===
-                    # 原代码: teacher_log_prob_output = self.ref_policy_wg.compute_log_prob(teacher_batch)
-                    # 原代码: teacher_full_log_probs = teacher_log_prob_output.batch['old_log_probs']
                     
-                    # 新代码:
                     teacher_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(teacher_batch)
-                    teacher_full_log_probs = teacher_log_prob_output.batch['ref_log_prob'] # 注意 Key 变成了 ref_log_prob
+                    teacher_full_log_probs = teacher_log_prob_output.batch['ref_log_prob']
                     
-                    # === FIX: 将 Teacher 的 LogProbs 从 Left Pad 转为 Right Pad ===
-                    # 这里的 teacher_batch['response_mask'] 是 Left Padded 的，正好用来提取有效 LogProbs
-                    t_resp_mask = teacher_batch.batch['response_mask']
-                    
-                    # 转换!
-                    teacher_full_log_probs_aligned = left_to_right_padding(teacher_full_log_probs, t_resp_mask)
-                    
-                    # 现在的 teacher_full_log_probs_aligned 是 [Let, 's, ..., Pad, Pad]
-                    # 与 Student 的结构一致了
-                    # ==========================================================
+                    # === 新增: 获取 Teacher 的 Argmax Token ID ===
+                    # 注意：如果 dp_actor 没改好，这里会报错 KeyError
+                    teacher_full_argmax = teacher_log_prob_output.batch['ref_argmax'] 
 
+                    # === FIX: 将 Teacher 的 LogProbs 从 Left Pad 转为 Right Pad ===
+                    t_resp_mask = teacher_batch.batch['response_mask']
+                    teacher_full_log_probs_aligned = left_to_right_padding(teacher_full_log_probs, t_resp_mask)
+                    teacher_full_argmax_aligned = left_to_right_padding(teacher_full_argmax, t_resp_mask) # <--- 对齐 Argmax
+
+                    # === 核心修改: 将对齐后的 Teacher LogProb 存入 batch，作为 K2 Loss 的 Target ===
+                    batch.batch['ref_log_prob'] = teacher_full_log_probs_aligned
+                    
                     # === FIX: 强制 Student LogProb 计算使用 Temp=1.0 ===
-                    # 避免继承生成时的低温参数导致 LogProb 为 0
                     batch.meta_info['temperature'] = 1.0 
                     student_log_prob_output = self.actor_rollout_wg.compute_log_prob(batch)
                     student_full_log_probs = student_log_prob_output.batch['old_log_probs']
                     
-                    # === Log Part 1: Generation Content ===
+                    # === Log Part 1: Generation Content (Debug Info) ===
                     if True:
                         print(f"\n{'='*20} Teacher-Student Reflection Debug (Step {self.global_steps}) {'='*20}")
                         try:
@@ -1034,15 +1022,16 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                         print(f"{'='*60}\n")
                     # ======================================
 
-                    # 3.6 Reward Calculation
+                    # 3.6 Reward Calculation (仅用于 Logging, K2 Loss 不需要 Reward)
                     token_level_rewards = torch.zeros_like(student_full_log_probs)
                     s_probs = student_full_log_probs
-                    t_probs = teacher_full_log_probs_aligned # <--- 使用对齐后的 Tensor
+                    t_probs = teacher_full_log_probs_aligned 
                     
                     min_len = min(s_probs.shape[1], t_probs.shape[1])
                     s_part = s_probs[:, :min_len]
                     t_part = t_probs[:, :min_len]
                     
+                    # 计算原始差异 (用于观察)
                     kl_diff = t_part - s_part
 
                     # =================================================================
@@ -1111,12 +1100,13 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                                 print("[OK] Token IDs match perfectly.")
 
                             print(f"\n--- Token-wise KL Breakdown ---")
-                            print(f"{'Token':<15} | {'ID':<6} | {'S_LogP':<8} | {'T_LogP':<8} | {'Diff':<8}")
-                            print("-" * 75)
+                            print(f"{'Token':<15} | {'ID':<6} | {'S_LogP':<8} | {'T_LogP':<8} | {'Diff':<8} | {'Teacher Preferred'}")
+                            print("-" * 95)
                             s_vals = s_part[idx].tolist()
                             t_vals = t_part[idx].tolist() # 这里引用的 t_part 已经是 Right Padded 的了
                             diff_vals = kl_diff[idx].tolist()
-                            
+                            # 获取当前样本的 Teacher Preferred Tokens
+                            t_preferred_ids = teacher_full_argmax_aligned[idx].tolist()
                             valid_count = 0
                             for i in range(len(s_ids)):
                                 # if valid_count >= 50: break
@@ -1124,20 +1114,32 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                                 
                                 tid = s_ids[i].item()
                                 token_str = self.tokenizer.decode([tid]).replace('\n', '\\n')
-                                if np.abs(diff_vals[i]) < 0.1:
-                                    print(f"{token_str:<15} | {tid:<6} | {s_vals[i]:.2f}   | {t_vals[i]:.2f}   | {diff_vals[i]:.2f}")
+                                                                # 获取 Teacher 想要什么
+                                t_pref_id = t_preferred_ids[i]
+                                # 如果是 Padding (0)，显示为 Pad
+                                if i >= len(t_ids): # 简单的越界保护
+                                    t_pref_str = "[PAD]"
                                 else:
-                                    print(f"{token_str:<15} | {tid:<6} | {s_vals[i]:.2f}   | {t_vals[i]:.2f}   | {diff_vals[i]:.2f}  <<<")
+                                    t_pref_str = self.tokenizer.decode([t_pref_id]).replace('\n', '\\n').strip()
+                                diff_val = diff_vals[i]
+                                
+                                # 格式化输出
+                                row_str = f"{token_str:<15} | {tid:<6} | {s_vals[i]:.2f}   | {t_vals[i]:.2f}   | {diff_val:.2f}   "
+                                
+                                if np.abs(diff_val) < 0.1:
+                                    print(f"{row_str} | {t_pref_str}")
+                                else:
+                                    # 差异大时，高亮显示 Teacher 想要的 Token
+                                    print(f"{row_str} | >> {t_pref_str} <<")
                                 valid_count += 1
                                 
                         except Exception as e:
                             print(f"Log Error 2: {e}")
                         print(f"{'='*60}\n")
                     # ==========================================
-
-                    kl_diff = torch.clamp(kl_diff, min=-1.0, max=1.0)
-                    token_level_rewards[:, :min_len] = kl_diff
                     
+                    # 记录 diff 到 reward 以便 tensorboard 观察，但不截断
+                    token_level_rewards[:, :min_len] = kl_diff
                     batch.batch['token_level_rewards'] = token_level_rewards
                     
                     valid_mask = batch.batch['response_mask']
@@ -1145,7 +1147,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                         mean_kl = (token_level_rewards * valid_mask).sum() / (valid_mask.sum() + 1e-6)
                         metrics['reward/reflection_kl'] = mean_kl.item()
 
-                # --- Step 4: PPO Flow ---
+                # --- Step 4: Update Flow (K2 Mode) ---
                 entropys = student_log_prob_output.batch['entropys']
                 entropy_agg = torch.mean(entropys)
                 metrics['actor/entropy'] = entropy_agg.item()
@@ -1156,30 +1158,22 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 if "values" not in batch.batch.keys():
                     batch.batch["values"] = torch.zeros_like(batch.batch["token_level_rewards"])
 
-                with marked_timer("adv", timing_raw):
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                        num_repeat=self.config.actor_rollout_ref.rollout.n,
-                        norm_adv_by_std_in_grpo=self.config.algorithm.get('norm_adv_by_std_in_grpo', True),
-                        config=self.config.algorithm
-                    )
+                # === 核心修改: 禁用 GAE (compute_advantage) ===
+                # 专家建议使用 K2 Loss (MSE)，这意味着不需要 GAE 的时间平滑。
+                # 直接将 advantages 设为 0 (或者 diff)，因为 dp_actor 会忽略它，直接用 ref_log_prob 算 MSE。
+                # 为了防止 verl 内部报错，我们保留数据结构。
+                batch.batch['advantages'] = torch.zeros_like(batch.batch['token_level_rewards'])
+                batch.batch['returns'] = torch.zeros_like(batch.batch['token_level_rewards'])
                 
-                batch.batch['advantages'] = batch.batch['token_level_rewards']
+                # 原有的 compute_advantage 被注释掉，避免 GAE 引入偏差
+                # with marked_timer("adv", timing_raw):
+                #     batch = compute_advantage(...)
 
                 with marked_timer("update_actor", timing_raw):
                     actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
-                # =================================================================
-                # === FIX: 添加 Validation/Testing 逻辑 ===
-                # =================================================================
-                # 检查是否满足测试条件：
-                # 1. 存在验证集 Reward Function
-                # 2. test_freq 设置大于 0
-                # 3. 步数整除 OR 是最后一步
+                
                 logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)
                 self.global_steps += 1
