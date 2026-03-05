@@ -350,7 +350,8 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-
+        if "ref_log_prob" not in select_keys:
+            select_keys.append("ref_log_prob")
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -397,7 +398,9 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
-
+                    # 获取 Teacher 的 log_prob (从 batch 里拿)
+                    ref_log_prob = model_inputs["ref_log_prob"]
+                    response_mask = model_inputs["response_mask"]
                     # =========================================================================
                     # 修复: 健壮地读取 loss_mode
                     # =========================================================================
@@ -406,19 +409,26 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-                    # =========================================================================
-                    # 新增: distillation 模式 (Pure Policy Gradient / No Clipping)
-                    # =========================================================================
+                    # =========================================================
+                    # 【核心修改】实现 K2 Loss (MSE Regression)
+                    # =========================================================
                     if loss_mode == "distillation":
-                        # 直接最大化 (advantages * log_prob)
-                        # 我们假设 advantages 已经包含了 (log P_T - log P_S) 的信号
-                        # 这是一个无偏的 KL 散度梯度估计
-                        pg_loss = -verl_F.masked_mean(advantages * log_prob, response_mask)
+                        # 公式: L = 0.5 * (log_P_Student - log_P_Teacher)^2
+                        # 这是一个回归 Loss，Beta=1
                         
-                        # 占位符，避免日志报错
-                        pg_clipfrac = torch.tensor(0.0, device=pg_loss.device)
-                        ppo_kl = torch.tensor(0.0, device=pg_loss.device)
-                        pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+                        diff = log_prob - ref_log_prob
+                        
+                        # MSE Loss
+                        k2_loss = 0.5 * (diff ** 2)
+                        
+                        # 只计算有效 Token 的 Loss
+                        policy_loss = verl_F.masked_mean(k2_loss, response_mask)
+                        
+                        # 记录 Log 用于调试
+                        pg_loss = policy_loss # 借用变量名方便 Log
+                        pg_clipfrac = torch.tensor(0.0)
+                        ppo_kl = diff.mean() # 记录一下平均差异
+                        pg_clipfrac_lower = torch.tensor(0.0)
 
                     elif loss_mode == "vanilla":
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
