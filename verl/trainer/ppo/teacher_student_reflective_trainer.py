@@ -884,7 +884,32 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     teacher_full_log_probs_aligned = left_to_right_padding(teacher_full_log_probs, t_resp_mask)
                     teacher_full_argmax_aligned = left_to_right_padding(teacher_full_argmax, t_resp_mask) # <--- 对齐 Argmax
 
-                    # === 核心修改: 将对齐后的 Teacher LogProb 存入 batch，作为 K2 Loss 的 Target ===
+                    # === FIX: 形状对齐 (Padding 修复) ===
+                    # Teacher 的 LogProb 长度可能只是当前 Batch 的最大长度 (例如 5824)
+                    # 而 Student 的 Responses 可能被 Pad 到了全局最大长度 (例如 14336)
+                    # 我们需要将 Teacher LogProb Pad 到与 Student 一致
+                    
+                    student_resp_len = batch.batch['responses'].shape[1]
+                    teacher_logp_len = teacher_full_log_probs_aligned.shape[1]
+                    
+                    if teacher_logp_len < student_resp_len:
+                        # 需要 Padding
+                        pad_len = student_resp_len - teacher_logp_len
+                        # 构造全 0 的 Padding (LogProb 为 0 意味着概率为 1，这不太对，但在 Mask 之外无所谓)
+                        # 或者用极小值，但在 MaskedMean 中会被忽略，所以 0 也可以
+                        padding = torch.zeros(
+                            (teacher_full_log_probs_aligned.shape[0], pad_len),
+                            dtype=teacher_full_log_probs_aligned.dtype,
+                            device=teacher_full_log_probs_aligned.device
+                        )
+                        # 拼接 (假设是 Right Padding)
+                        teacher_full_log_probs_aligned = torch.cat([teacher_full_log_probs_aligned, padding], dim=1)
+                    
+                    elif teacher_logp_len > student_resp_len:
+                        # 理论上不应该发生，但防一手：截断
+                        teacher_full_log_probs_aligned = teacher_full_log_probs_aligned[:, :student_resp_len]
+
+                    # 赋值回 batch
                     batch.batch['ref_log_prob'] = teacher_full_log_probs_aligned
                     
                     # === FIX: 强制 Student LogProb 计算使用 Temp=1.0 ===
