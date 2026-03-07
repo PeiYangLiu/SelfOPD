@@ -49,6 +49,8 @@ def extract_answer(text: str) -> str:
     """从文本中提取 #### 后的答案，用于简单的正确性匹配"""
     if "####" in text:
         return text.split("####")[-1].strip()
+    if 'Answer:' in text[-20:]:
+        return text[-20:].split('Answer:')[-1].strip()
     return "[No Answer]"
 
 class TeacherStudentReflectiveTrainer(RayPPOTrainer):
