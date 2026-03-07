@@ -104,7 +104,8 @@ def default_compute_score(
     elif data_source in [
         'frozenlake',
     ]:
-        pass
+        from . import game
+        res = game.compute_score(solution_str, ground_truth)
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
