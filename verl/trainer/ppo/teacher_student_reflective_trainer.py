@@ -943,6 +943,8 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                             # 1. 获取 GT
                             gt_raw = current_ground_truths[idx]
                             gt_ans = extract_answer(gt_raw)
+                            if gt_ans == "[No Answer]" and len(gt_raw) < 20 and type(gt_raw) == str: 
+                                gt_ans = gt_raw.strip()
                             # 2. 获取 Student Response
                             s_ids = batch.batch['responses'][idx]
                             s_ids = s_ids[s_ids != self.tokenizer.pad_token_id]
@@ -960,7 +962,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                             status_icon = "✅" if is_correct else "❌"
                             
                             print(f"--- [Answer Check] ---")
-                            print(f"Ground Truth Raw: {str(gt_raw[-50:]).strip()}...") # 只打印最后一点
+                            print(f"Ground Truth Raw: {str(gt_raw)[-50:].strip()}...") # 只打印最后一点
                             print(f"Student Answer:   {s_ans}")
                             print(f"Target Answer:    {gt_ans}")
                             print(f"Result:           {status_icon} (Match: {is_correct})")
