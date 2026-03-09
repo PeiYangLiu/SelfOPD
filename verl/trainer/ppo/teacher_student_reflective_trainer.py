@@ -1091,9 +1091,35 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                             metrics['debug/diff_logp_min'] = diff_valid.min().item()
                             metrics['debug/diff_logp_mean'] = diff_valid.mean().item()
                             
-                            # 6. (可选) 监控 Teacher 是否过于自信
-                            # 如果 Teacher LogP 经常接近 0 (Max ~ 0)，说明 Teacher 非常确信
-                            # 如果 Diff Max 很大 (e.g. > 5.0)，说明 Teacher 觉得 Student 错得离谱
+                        # === NEW: Sequence Length Metrics ===
+                        # 安全获取 Pad Token ID (防止没有 pad_token_id 的情况)
+                        s_pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+                        t_pad_id = self.teacher_tokenizer.pad_token_id if self.teacher_tokenizer.pad_token_id is not None else self.teacher_tokenizer.eos_token_id
+
+                        # 1. Prompt Length (原始问题长度)
+                        prompt_lens = (batch.batch['prompts'] != s_pad_id).sum(dim=-1).float()
+                        metrics['debug/prompt_len_mean'] = prompt_lens.mean().item()
+                        metrics['debug/prompt_len_max'] = prompt_lens.max().item()
+                        metrics['debug/prompt_len_min'] = prompt_lens.min().item()
+                        
+                        # 2. Student Response Length (学生回答长度)
+                        student_resp_lens = (batch.batch['responses'] != s_pad_id).sum(dim=-1).float()
+                        metrics['debug/student_resp_len_mean'] = student_resp_lens.mean().item()
+                        metrics['debug/student_resp_len_max'] = student_resp_lens.max().item()
+                        metrics['debug/student_resp_len_min'] = student_resp_lens.min().item()
+                        
+                        # 3. Teacher Summary Length (老师总结的长度)
+                        summary_lens = (summaries != t_pad_id).sum(dim=-1).float()
+                        metrics['debug/teacher_summary_len_mean'] = summary_lens.mean().item()
+                        metrics['debug/teacher_summary_len_max'] = summary_lens.max().item()
+                        metrics['debug/teacher_summary_len_min'] = summary_lens.min().item()
+                        
+                        # 4. Teacher Forward Length (老师重新计算概率时的总上下文长度)
+                        teacher_forward_lens = (teacher_batch.batch['input_ids'] != t_pad_id).sum(dim=-1).float()
+                        metrics['debug/teacher_forward_len_mean'] = teacher_forward_lens.mean().item()
+                        metrics['debug/teacher_forward_len_max'] = teacher_forward_lens.max().item()
+                        metrics['debug/teacher_forward_len_min'] = teacher_forward_lens.min().item()
+                        
                     # =================================================================
 
                     # === Log Part 2: Token-Level KL Analysis ===
