@@ -69,7 +69,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.use_reference_policy, "TeacherStudentReflectiveTrainer requires a Reference Policy (Teacher)!"
-        self.use_critic = False
+        # self.use_critic = False
         self.use_rm = False
         
         # === NEW: Load Teacher Tokenizer ===
@@ -208,22 +208,10 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             # === KEY CHANGE: 这里的 role 改回 "ref" ===
             # 这告诉 verl 使用 ActorRolloutRefWorker 的 ref_model 逻辑，而不是 actor 逻辑
             # 并且不会初始化 vLLM
-            # teacher_cls = RayClassWithInitArgs(
-            #     cls=self.role_worker_mapping[Role.RefPolicy],
-            #     config=teacher_config,
-            #     role="ref",  # <--- 改回 ref
-            #     profile_option=self.config.trainer.npu_profile.options,
-            # )
-                        # === 开启 Teacher 的 vLLM 以支持 Debug 续写 ===
-            # 必须设置 gpu_memory_utilization，否则 vLLM 会报错
-            if 'rollout' not in teacher_config:
-                teacher_config.rollout = OmegaConf.create()
-            teacher_config.rollout.gpu_memory_utilization = self.config.actor_rollout_ref.rollout.gpu_memory_utilization
-            
             teacher_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.RefPolicy],
                 config=teacher_config,
-                role="actor_rollout_ref",  # <--- 改为 actor_rollout_ref，强制初始化 vLLM
+                role="ref",  # <--- 改回 ref
                 profile_option=self.config.trainer.npu_profile.options,
             )
             self.resource_pool_to_cls[teacher_pool]["ref"] = teacher_cls
@@ -334,22 +322,10 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             # === KEY CHANGE: 这里的 role 改回 "ref" ===
             # 这告诉 verl 使用 ActorRolloutRefWorker 的 ref_model 逻辑，而不是 actor 逻辑
             # 并且不会初始化 vLLM
-            # teacher_cls = RayClassWithInitArgs(
-            #     cls=self.role_worker_mapping[Role.RefPolicy],
-            #     config=teacher_config,
-            #     role="ref",  # <--- 改回 ref
-            #     profile_option=self.config.trainer.npu_profile.options,
-            # )
-                        # === 开启 Teacher 的 vLLM 以支持 Debug 续写 ===
-            # 必须设置 gpu_memory_utilization，否则 vLLM 会报错
-            if 'rollout' not in teacher_config:
-                teacher_config.rollout = OmegaConf.create()
-            teacher_config.rollout.gpu_memory_utilization = self.config.actor_rollout_ref.rollout.gpu_memory_utilization
-            
             teacher_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.RefPolicy],
                 config=teacher_config,
-                role="actor_rollout_ref",  # <--- 改为 actor_rollout_ref，强制初始化 vLLM
+                role="ref",  # <--- 改回 ref
                 profile_option=self.config.trainer.npu_profile.options,
             )
             self.resource_pool_to_cls[teacher_pool]["ref"] = teacher_cls
@@ -1019,58 +995,63 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                             print(f"--- [2] Teacher LogProb Input (Full Context) ---\n{t_full_text.strip()}\n")
 
                             # =================================================================
-                            # === NEW DEBUG: 让 Teacher 接着 Student 的 response 继续生成 ===
+                            # === NEW DEBUG ADDITION: 让 Teacher 自由生成，看看它想说什么 ===
                             # =================================================================
-                            print(f"--- [3.5] Teacher Continuation Probe ---")
-                            try:
-                                # 1. 提取当前样本 (Prompt + Student Response)
-                                # teacher_batch.batch['input_ids'] 已经是 Left-Padded，且去除了右侧的 Pad
-                                # 结构为: [Pad, Pad, ..., Prompt, Student_Response]
-                                cont_input_ids = teacher_batch.batch['input_ids'][idx].unsqueeze(0)
-                                cont_att_mask = teacher_batch.batch['attention_mask'][idx].unsqueeze(0)
-                                cont_pos_ids = teacher_batch.batch['position_ids'][idx].unsqueeze(0)
-                                
-                                # 2. 构造单样本 Batch
-                                cont_batch = DataProto.from_dict({
-                                    "input_ids": cont_input_ids,
-                                    "attention_mask": cont_att_mask,
-                                    "position_ids": cont_pos_ids
-                                })
-                                
-                                # 3. 获取 World Size 并复制样本 (必须填满所有 GPU，否则无法分发)
-                                world_size = self.ref_policy_wg.world_size
-                                cont_batch = cont_batch.repeat(repeat_times=world_size, interleave=True)
-                                
-                                # 4. 设置生成参数 (Greedy Decoding)
-                                cont_batch.meta_info = {
-                                    "do_sample": False,
-                                    "max_new_tokens": 128, # 让 Teacher 续写最多 128 个 Token
-                                    "temperature": 1.0,
-                                    "micro_batch_size": world_size, 
-                                    "use_dynamic_bsz": False,
-                                    "eos_token_id": self.teacher_tokenizer.eos_token_id,
-                                    "pad_token_id": self.teacher_tokenizer.pad_token_id,
-                                }
-                                
-                                # 5. 调用 Teacher 生成 (续写)
-                                cont_output = self.ref_policy_wg.generate_sequences(cont_batch)
-                                
-                                # 6. 解码 Teacher 续写的内容
-                                cont_resp_ids = cont_output.batch['responses'][0]
-                                # 过滤掉 padding
-                                cont_resp_ids = cont_resp_ids[cont_resp_ids != self.teacher_tokenizer.pad_token_id]
-                                cont_resp_text = self.teacher_tokenizer.decode(cont_resp_ids, skip_special_tokens=True)
-                                
-                                print(f"Student ended at:  ... {s_resp_text[-50:].strip()}")
-                                print(f"Teacher continues: \n>> {cont_resp_text.strip()} <<\n")
-                                
-                            except Exception as e:
-                                print(f"[Teacher Continuation Failed] {e}")
-                                print(">>> 提示: 如果报错 'NoneType' object has no attribute 'generate_sequences'，")
-                                print(">>> 是因为在 init_workers 中 Teacher 的 role 设置为了 'ref'，导致未初始化 vLLM。")
-                                print(">>> 如需运行此 Debug，需将 Teacher 的 role 改为 'actor_rollout_ref' 或 'rollout'。")
-                            # =================================================================
+                            # print(f"--- [3] Teacher Greedy Generation Probe ---")
                             
+                            # # 1. 提取 Prompt 部分（去掉 Response）
+                            # t_resp_mask = teacher_batch.batch['response_mask'][idx]
+                            # resp_start_indices = (t_resp_mask == 1).nonzero(as_tuple=True)[0]
+                            
+                            # if len(resp_start_indices) > 0:
+                            #     resp_start_idx = resp_start_indices[0].item()
+                                
+                            #     # 截取 Prompt 的 input_ids, attention_mask, position_ids
+                            #     # 维度变为 (1, seq_len)
+                            #     probe_input_ids = teacher_batch.batch['input_ids'][idx][:resp_start_idx].unsqueeze(0)
+                            #     probe_att_mask = teacher_batch.batch['attention_mask'][idx][:resp_start_idx].unsqueeze(0)
+                            #     probe_pos_ids = teacher_batch.batch['position_ids'][idx][:resp_start_idx].unsqueeze(0)
+                                
+                            #     # 构造单样本 Batch
+                            #     probe_batch = DataProto.from_dict({
+                            #         "input_ids": probe_input_ids,
+                            #         "attention_mask": probe_att_mask,
+                            #         "position_ids": probe_pos_ids
+                            #     })
+                                
+                            #     # === FIX: 获取 World Size 并复制样本 ===
+                            #     # 必须填满所有 GPU，否则无法分发
+                            #     world_size = self.ref_policy_wg.world_size
+                            #     probe_batch = probe_batch.repeat(repeat_times=world_size, interleave=True)
+                            #     # =====================================
+
+                            #     # 设置为 Greedy Decoding
+                            #     probe_batch.meta_info = {
+                            #         "do_sample": False,
+                            #         "max_new_tokens": 50, 
+                            #         "temperature": 1.0,
+                            #         # 必须设置这些以避免动态 Batch 相关的错误
+                            #         "micro_batch_size": world_size, 
+                            #         "use_dynamic_bsz": False
+                            #     }
+                                
+                            #     # 调用 Teacher 生成
+                            #     probe_output = self.ref_policy_wg.generate_sequences(probe_batch)
+                                
+                            #     # 取第一个结果即可（所有结果都是一样的）
+                            #     probe_resp_ids = probe_output.batch['responses'][0]
+                            #     probe_resp_text = self.tokenizer.decode(probe_resp_ids, skip_special_tokens=True)
+                                
+                            #     print(f"Given the prompt above, Teacher naturally wants to say:\n>> {probe_resp_text.strip()} <<")
+                                
+                            #     # 对比 Student 的开头
+                            #     s_ids = batch.batch['responses'][idx]
+                            #     s_ids = s_ids[s_ids != self.tokenizer.pad_token_id]
+                            #     s_resp_text = self.tokenizer.decode(s_ids, skip_special_tokens=True)
+                            #     print(f"But Student actually said:\n>> {s_resp_text.strip()} <<")
+                            # else:
+                            #     print("Error: Could not find response start index.")
+                            # # =================================================================
                             print(f"--- [4] Deep Inspection of Teacher Batch ---")
                             # 打印前 10 个 Input IDs 和 Attention Mask
                             print(f"Input IDs (first 20): {teacher_batch.batch['input_ids'][idx][:20].tolist()}")
@@ -1101,7 +1082,8 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     
                     # 计算原始差异 (用于观察)
                     kl_diff = t_part - s_part
-                    distill_reward = kl_diff
+                    reward_clamp_val = self.config.algorithm.get('reward_clamp_val', 5.0) # 建议在 config 里配置
+                    kl_diff = torch.clamp(kl_diff, min=-reward_clamp_val, max=reward_clamp_val)
 
                     # =================================================================
                     # === FIX: Add Debug Metrics (Logits Statistics) ===
@@ -1236,13 +1218,12 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     # 记录 diff 到 reward 以便 tensorboard 观察，但不截断
                     token_level_rewards[:, :min_len] = kl_diff
                     batch.batch['token_level_rewards'] = token_level_rewards
-                    
                     valid_mask = batch.batch['response_mask']
                     with torch.no_grad():
                         mean_kl = (token_level_rewards * valid_mask).sum() / (valid_mask.sum() + 1e-6)
                         metrics['reward/reflection_kl'] = mean_kl.item()
 
-                # --- Step 4: Update Flow (K2 Mode) ---
+                # --- Step 4: Update Flow (RL PPO Mode) ---
                 entropys = student_log_prob_output.batch['entropys']
                 entropy_agg = torch.mean(entropys)
                 metrics['actor/entropy'] = entropy_agg.item()
@@ -1250,20 +1231,35 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 student_log_prob_output.batch.pop('entropys', None)
                 batch = batch.union(student_log_prob_output)
 
-                if "values" not in batch.batch.keys():
-                    batch.batch["values"] = torch.zeros_like(batch.batch["token_level_rewards"])
+                # 1. 计算 Critic 的 Values (用于 GAE Baseline)
+                if self.use_critic:
+                    with marked_timer("values", timing_raw, color="cyan"):
+                        values = self.critic_wg.compute_values(batch)
+                        batch = batch.union(values)
+                else:
+                    if "values" not in batch.batch.keys():
+                        batch.batch["values"] = torch.zeros_like(batch.batch["token_level_rewards"])
 
-                # === 核心修改: 禁用 GAE (compute_advantage) ===
-                # 专家建议使用 K2 Loss (MSE)，这意味着不需要 GAE 的时间平滑。
-                # 直接将 advantages 设为 0 (或者 diff)，因为 dp_actor 会忽略它，直接用 ref_log_prob 算 MSE。
-                # 为了防止 verl 内部报错，我们保留数据结构。
-                batch.batch['advantages'] = torch.zeros_like(batch.batch['token_level_rewards'])
-                batch.batch['returns'] = torch.zeros_like(batch.batch['token_level_rewards'])
-                
-                # 原有的 compute_advantage 被注释掉，避免 GAE 引入偏差
-                # with marked_timer("adv", timing_raw):
-                #     batch = compute_advantage(...)
+                # 2. 计算 Advantages (使用 verl 内置的 GAE)
+                with marked_timer("adv", timing_raw):
+                    batch = compute_advantage(
+                        data=batch,
+                        adv_estimator=self.config.algorithm.adv_estimator,
+                        gamma=self.config.algorithm.get('gamma', 1.0),
+                        lam=self.config.algorithm.get('lam', 1.0),
+                        num_repeat=self.config.actor_rollout_ref.rollout.n,
+                        norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                        config=self.config.algorithm,
+                    )
 
+                # 3. 更新 Critic
+                if self.use_critic:
+                    with marked_timer("update_critic", timing_raw, color="pink"):
+                        critic_output = self.critic_wg.update_critic(batch)
+                    critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                    metrics.update(critic_output_metrics)
+
+                # 4. 更新 Actor (使用标准的 PPO Vanilla Loss)
                 with marked_timer("update_actor", timing_raw):
                     actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
