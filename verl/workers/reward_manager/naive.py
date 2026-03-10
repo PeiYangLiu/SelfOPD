@@ -53,6 +53,7 @@ class NaiveRewardManager:
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
+        error_cases = []  # Collect incorrect predictions for logging
 
         already_print_data_sources = {}
 
@@ -92,6 +93,17 @@ class NaiveRewardManager:
                 # Store the information including original reward
                 for key, value in score.items():
                     reward_extra_info[key].append(value)
+                
+                # Collect error cases for logging
+                if score.get("acc", False) is False:
+                    error_cases.append({
+                        "data_source": data_source,
+                        "prompt": prompt_str,
+                        "response": response_str,
+                        "ground_truth": ground_truth,
+                        "model_pred": score.get("pred", "N/A"),
+                        "score": score.get("score", reward),
+                    })
             else:
                 reward = score
 
@@ -111,10 +123,27 @@ class NaiveRewardManager:
                 else:
                     print("[score]", score)
 
+        # Log all error cases
+        if error_cases:
+            print("\n" + "="*100)
+            print(f"❌ VALIDATION ERROR CASES - Total: {len(error_cases)}")
+            print("="*100)
+            for idx, case in enumerate(error_cases, 1):
+                print(f"\n【Error {idx}】- {case['data_source']}")
+                print(f"Question: {case['prompt'][:300]}")
+                if len(case['prompt']) > 300:
+                    print("...")
+                print(f"\nModel Output (last 300 chars):\n{case['response'][-300:]}")
+                print(f"\nCorrect Answer: {case['ground_truth']}")
+                print(f"Model Predicted: {case['model_pred']}")
+                print(f"Score: {case['score']}")
+                print("-" * 100)
+
         if return_dict:
             return {
                 "reward_tensor": reward_tensor,
                 "reward_extra_info": reward_extra_info,
+                "error_cases": error_cases,
             }
         else:
             return reward_tensor
