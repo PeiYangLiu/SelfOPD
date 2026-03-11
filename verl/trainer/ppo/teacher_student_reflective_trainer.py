@@ -440,23 +440,24 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             # 3. 移除可能残留的 User 结束标记 (如 <|im_end|>)
             if "<|im_end|>" in p_text_clean:
                 p_text_clean = p_text_clean.replace("<|im_end|>", "")
-            
             p_text_clean = p_text_clean.strip()
             # ----------------------------------------
 
             r_text = self.tokenizer.decode(r_ids, skip_special_tokens=True)
-            
+            r_text = r_text.replace("<think>", "<student_think>")
+            r_text = r_text.replace("</think>", "</student_think>")
             # Prompt for the Teacher (Summary Generation)
             content = (
-                f"Question: {p_text_clean}\n\n"
-                f"Standard Answer: {gt_text}\n\n"
-                f"Student Answer: {r_text}\n\n"
+                f"<question>{p_text_clean}</question>\n\n"
+                f"<standard_answer>{gt_text}</standard_answer>\n\n"
+                f"<student_answer>{r_text}</student_answer>\n\n"
                 f"Task: Summary the Student Answer\n"
+                f"If the student answer is incorrect, please focus on analyzing the mistake and point out where the student is wrong."
                 f"Answer concisely."
             )
 
             messages = [
-                {"role": "system", "content": "You are a helpful math assistant."},
+                {"role": "system", "content": "You are a helpful math assistant. I will give you a math question and it's standard answer. I will also give you a student's answer. Please summarize the student's answer concisely."},
                 {"role": "user", "content": content}
             ]
 
@@ -605,24 +606,20 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 s_ids = summaries[i]
                 s_ids = s_ids[s_ids != self.teacher_tokenizer.pad_token_id]
                 s_text = self.teacher_tokenizer.decode(s_ids, skip_special_tokens=True)
-                
-                if "####" in s_text:
-                    s_text = s_text.split("####")[0].strip()
-                s_text = s_text.replace("Yes, the student answer is correct.", "").strip()
+                s_text = s_text.replace("<think>", "<analysis_think>")
+                s_text = s_text.replace("</think>", "</analysis_think>")
 
                 # System Prompt 注入 Hint
                 system_content = (
                     "You are a helpful math assistant.\n"
-                    "I will provide a reference analysis (Hint) below. "
-                    "I will also provide the ground truth (GT) below. "
-                    "The hint may be fault and the ground truth is always correct. "
-                    "Please use this ground truth and hint to help you solve the user's problem step-by-step.\n\n"
+                    "I will provide an analysis below. "
+                    "I will also provide the standard answer below. "
+                    "The analysis may be fault and the standard answer is always correct. "
+                    "Please use this standard answer and analysis to help you solve the user's problem step-by-step.\n\n"
                 )
                 user_content = (
-                    "Reference Analysis/Hint:\n"
-                    f"{s_text}\n\n"
-                    "Standard Solution (Ground Truth):\n" 
-                    f"{gt_text}\n\n"
+                    f"<analysis>{s_text}</analysis>\n\n"
+                    f"<standard_answer>{gt_text}</standard_answer>\n\n"
                     "Instruction: Solve the problem step-by-step. Do not just state the answer."
                 )
                 
