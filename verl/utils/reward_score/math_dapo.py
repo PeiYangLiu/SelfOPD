@@ -158,8 +158,9 @@ def normalize_final_answer(final_answer: str) -> str:
     # Normalize numbers
     if final_answer.replace(",", "").isdigit():
         final_answer = final_answer.replace(",", "")
-
-    return final_answer.strip()
+    if 'Answer:' in final_answer:
+        final_answer = final_answer.split('Answer:')[-1]
+    return final_answer.strip().strip('!')
 
 
 def is_correct_minerva(
@@ -178,7 +179,13 @@ def is_correct_minerva(
     """
     # Extract answer from solution
     match = re.findall(answer_pattern, solution_str)
-    extracted_answer = match[-1] if match else "[INVALID]"
+    boxed_answer = last_boxed_only_string(solution_str)
+    if match:
+        extracted_answer = match[-1]
+    elif boxed_answer:
+        extracted_answer = remove_boxed(boxed_answer).strip().strip('!')
+    else:
+        extracted_answer = "[INVALID]"
     pred = normalize_final_answer(extracted_answer)
 
     # Process ground truth
