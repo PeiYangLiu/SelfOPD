@@ -193,8 +193,8 @@ def is_correct_minerva(
         gt = normalize_final_answer(remove_boxed(last_boxed_only_string(gt)))
     else:
         gt = normalize_final_answer(gt)
-    if boxed_answer.find(gt) != -1 or match.find(gt) != -1:
-        return True, pred
+    if (boxed_answer and boxed_answer.find(gt) != -1) or (match and match[-1].find(gt) != -1):
+        return True, gt
 
     return (pred == gt), pred
 
