@@ -160,7 +160,8 @@ def normalize_final_answer(final_answer: str) -> str:
         final_answer = final_answer.replace(",", "")
     if 'Answer:' in final_answer:
         final_answer = final_answer.split('Answer:')[-1]
-    return final_answer.strip().strip('!')
+    final_answer = final_answer.replace("!", "").replace("*", "")
+    return final_answer.strip()
 
 
 def is_correct_minerva(
@@ -180,19 +181,20 @@ def is_correct_minerva(
     # Extract answer from solution
     match = re.findall(answer_pattern, solution_str)
     boxed_answer = last_boxed_only_string(solution_str)
-    if match:
+    if boxed_answer:
+        extracted_answer = remove_boxed(boxed_answer).strip()
+    elif match:
         extracted_answer = match[-1]
-    elif boxed_answer:
-        extracted_answer = remove_boxed(boxed_answer).strip().strip('!')
     else:
         extracted_answer = "[INVALID]"
     pred = normalize_final_answer(extracted_answer)
-
     # Process ground truth
     if gt_need_extract:
         gt = normalize_final_answer(remove_boxed(last_boxed_only_string(gt)))
     else:
         gt = normalize_final_answer(gt)
+    if boxed_answer.find(gt) != -1 or match.find(gt) != -1:
+        return True, pred
 
     return (pred == gt), pred
 
