@@ -740,7 +740,17 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
 
         self.global_steps = 0
         self._load_checkpoint()
-
+        # === 新增：官方 val_only 逻辑修复 ===
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            print(f">>> [Evaluation Mode] Starting initial validation at step {self.global_steps}...")
+            val_metrics = self._validate() 
+            print(f">>> Initial Validation Metrics: {val_metrics}")
+            logger.log(data=val_metrics, step=self.global_steps)
+            
+            # 如果设置了 val_only，直接退出，不进入下面的训练循环
+            if self.config.trainer.get("val_only", False):
+                print(">>> [Evaluation Mode] val_only=True detected. Exiting now.")
+                return 
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
         self.global_steps += 1
 
