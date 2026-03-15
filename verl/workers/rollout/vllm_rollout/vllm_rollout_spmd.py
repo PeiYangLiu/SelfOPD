@@ -304,7 +304,12 @@ class vLLMRollout(BaseRollout):
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
-
+            # ====================================================================
+            # [核心修复] 从 meta_info 读取 val_max_response_length，并映射为 vLLM 需要的 max_tokens
+            # ====================================================================
+            if "val_max_response_length" in prompts.meta_info:
+                kwargs["max_tokens"] = prompts.meta_info["val_max_response_length"]
+                print("Using val_max_response_length from meta_info: ", kwargs["max_tokens"])
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
@@ -337,13 +342,16 @@ class vLLMRollout(BaseRollout):
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                             curr_log_prob.append(logprob[response_ids[i]].logprob)
                         rollout_log_probs.append(curr_log_prob)
-
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
+            # ====================================================================
+            # [核心修复] 获取当前实际允许的最大长度 (验证时为 38912，训练时为 14336)
+            # ====================================================================
+            actual_max_length = kwargs.get("max_tokens", self.config.response_length)
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=actual_max_length).to(
                 idx.device
             )
             if self.config.calculate_log_probs:
                 rollout_log_probs = pad_2d_list_to_length(
-                    rollout_log_probs, -1, max_length=self.config.response_length
+                    rollout_log_probs, -1, max_length=actual_max_length
                 ).to(idx.device)
                 rollout_log_probs = rollout_log_probs.to(torch.float32)
 

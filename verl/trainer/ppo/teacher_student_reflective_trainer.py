@@ -340,12 +340,22 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             #     role="ref",  # <--- 改回 ref
             #     profile_option=self.config.trainer.npu_profile.options,
             # )
-                        # === 开启 Teacher 的 vLLM 以支持 Debug 续写 ===
+            # === 开启 Teacher 的 vLLM 以支持 Debug 续写 ===
             # 必须设置 gpu_memory_utilization，否则 vLLM 会报错
             if 'rollout' not in teacher_config:
                 teacher_config.rollout = OmegaConf.create()
-            teacher_config.rollout.gpu_memory_utilization = self.config.actor_rollout_ref.rollout.gpu_memory_utilization
+            # [核心修复]：Teacher 独占 GPU 且不训练，直接给 90% 的显存！
+            # 如果你在 bash 脚本里传了 +teacher.rollout.gpu_memory_utilization，就用传入的，否则默认 0.9
+            if OmegaConf.select(self.config, "teacher.rollout.gpu_memory_utilization"):
+                teacher_config.rollout.gpu_memory_utilization = self.config.teacher.rollout.gpu_memory_utilization
+            else:
+                teacher_config.rollout.gpu_memory_utilization = 0.9
             
+            # 同时保证 max_num_batched_tokens 和 max_model_len 也同步过来，防止 Teacher 爆显存
+            teacher_config.rollout.max_num_batched_tokens = self.config.actor_rollout_ref.rollout.max_num_batched_tokens
+            if OmegaConf.select(self.config, "actor_rollout_ref.rollout.max_model_len"):
+                teacher_config.rollout.max_model_len = self.config.actor_rollout_ref.rollout.max_model_len
+                
             teacher_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.RefPolicy],
                 config=teacher_config,
@@ -444,20 +454,20 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             # ----------------------------------------
 
             r_text = self.tokenizer.decode(r_ids, skip_special_tokens=True)
-            r_text = r_text.replace("<think>", "<student_think>")
-            r_text = r_text.replace("</think>", "</student_think>")
+            r_text = r_text.replace("<think>", "\n\n")
+            r_text = r_text.replace("</think>", "\n\n")
             # Prompt for the Teacher (Summary Generation)
             content = (
-                f"<question>{p_text_clean}</question>\n\n"
-                f"<standard_answer>{gt_text}</standard_answer>\n\n"
-                f"<student_answer>{r_text}</student_answer>\n\n"
-                f"Task: Summary the Student Answer\n"
-                f"If the student answer is incorrect, please focus on analyzing the mistake and point out where the student is wrong."
-                f"Answer concisely."
+                "I will give you a math question and it's ground_truth. I will also give you a solution. The solution may be incorrect."
+                f"question: {p_text_clean}\n\n"
+                f"ground_truth: {gt_text}\n\n"
+                f"solution: {r_text}\n\n"
+                f"Task: You need to analyze how to solve this problem based on the ground_truth and the solution. If the solution is correct, extract the key points that led to solving it correctly. If the solution is wrong, identify the traps in the question and what to watch out for.\n"
+                f"Reply directly with your extracted findings—no extra explanation needed."
             )
 
             messages = [
-                {"role": "system", "content": "You are a helpful math assistant. I will give you a math question and it's standard answer. I will also give you a student's answer. Please summarize the student's answer concisely."},
+                {"role": "system", "content": "You are a helpful math assistant."},
                 {"role": "user", "content": content}
             ]
 
@@ -606,21 +616,16 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 s_ids = summaries[i]
                 s_ids = s_ids[s_ids != self.teacher_tokenizer.pad_token_id]
                 s_text = self.teacher_tokenizer.decode(s_ids, skip_special_tokens=True)
-                s_text = s_text.replace("<think>", "<analysis_think>")
-                s_text = s_text.replace("</think>", "</analysis_think>")
-
+                if s_text.find('</think>') != -1:
+                    s_text[s_text.find('</think>')+len('</think>'):]
                 # System Prompt 注入 Hint
                 system_content = (
-                    "You are a helpful math assistant.\n"
-                    "I will provide an analysis below. "
-                    "I will also provide the standard answer below. "
-                    "The analysis may be fault and the standard answer is always correct. "
-                    "Please use this standard answer and analysis to help you solve the user's problem step-by-step.\n\n"
+                    "You are a helpful math assistant."
                 )
                 user_content = (
-                    f"<analysis>{s_text}</analysis>\n\n"
-                    f"<standard_answer>{gt_text}</standard_answer>\n\n"
-                    "Instruction: Solve the problem step-by-step. Do not just state the answer."
+                    "I will give you a math problem along with key hints for solving it.\n\n"
+                    f"Hints: {s_text}\n\n"
+                    "Please use these hints to help you solve the math problem."
                 )
                 
                 # 编码 Prompt (Teacher Tokenizer)
