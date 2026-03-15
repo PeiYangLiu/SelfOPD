@@ -16,6 +16,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import Tracking
 from verl.utils import hf_processor, hf_tokenizer
+from verl.utils.reward_score.math_dapo import is_correct_minerva
 from omegaconf import OmegaConf, open_dict
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -355,7 +356,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             teacher_config.rollout.max_num_batched_tokens = self.config.actor_rollout_ref.rollout.max_num_batched_tokens
             if OmegaConf.select(self.config, "actor_rollout_ref.rollout.max_model_len"):
                 teacher_config.rollout.max_model_len = self.config.actor_rollout_ref.rollout.max_model_len
-                
+
             teacher_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.RefPolicy],
                 config=teacher_config,
@@ -1001,7 +1002,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                             gt_raw = current_ground_truths[idx]
                             gt_ans = extract_answer(gt_raw)
                             if gt_ans == "[No Answer]" and len(gt_raw) < 20 and type(gt_raw) == str: 
-                                gt_ans = gt_raw.strip()
+                                gt_ans = gt_raw.strip().replace(',', '')
                             # 2. 获取 Student Response
                             s_ids = batch.batch['responses'][idx]
                             s_ids = s_ids[s_ids != self.tokenizer.pad_token_id]
@@ -1015,7 +1016,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                                 gt_ans = str(gt_raw)
                                 is_correct = (s_ans.split(',') in gt_raw)
                             else:
-                                is_correct = (s_ans.replace(',', '') == gt_ans.replace(',', ''))
+                                is_correct, s_ans = is_correct_minerva(s_resp_text, gt_ans)
                             status_icon = "✅" if is_correct else "❌"
                             
                             print(f"--- [Answer Check] ---")
