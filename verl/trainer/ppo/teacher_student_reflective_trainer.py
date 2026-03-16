@@ -67,6 +67,9 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
       two simultaneous vLLM instances without conflict.
     """
 
+    def _validate_config(self):
+        pass
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.use_reference_policy, "TeacherStudentReflectiveTrainer requires a Reference Policy (Teacher)!"
@@ -459,12 +462,12 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             r_text = r_text.replace("</think>", "\n\n")
             # Prompt for the Teacher (Summary Generation)
             content = (
-                "I will give you a math question and it's ground_truth. I will also give you a solution. The solution may be incorrect."
+                "I will give you a math question and it's ground truth. I will also give you a solution. The solution may be incorrect."
                 f"question: {p_text_clean}\n\n"
-                f"ground_truth: {gt_text}\n\n"
+                f"ground truth: {gt_text}\n\n"
                 f"solution: {r_text}\n\n"
-                f"Task: You need to analyze how to solve this problem based on the ground_truth and the solution. If the solution is correct, extract the key points that led to solving it correctly. If the solution is wrong, identify the traps in the question and what to watch out for.\n"
-                f"Reply directly with your extracted findings—no extra explanation needed."
+                f"Task: You need to analyze how to solve this problem based on the ground truth and the solution. If the solution is correct, extract the key points that led to solving it correctly. If the solution is wrong, identify the traps in the question and what to watch out for, so as to summarize key hints for the next person attempting the problem.\n"
+                f"Reply directly with your summarized hints—no extra explanation needed."
             )
 
             messages = [
@@ -822,30 +825,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 metrics = {}
 
                 timing_raw = {}
-
-                is_last_step = self.global_steps >= self.total_training_steps
-
-                if (
-                    self.val_reward_fn is not None
-                    and self.config.trainer.test_freq > 0
-                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0 or self.global_steps == 1)
-                ):
-                    print(f"Start Testing at step {self.global_steps}...")
-                    with marked_timer("testing", timing_raw, color="green"):
-                        # 调用父类 RayPPOTrainer 的 _validate 方法
-                        val_metrics: dict = self._validate() 
-                    
-                    # 将测试指标添加到 metrics 中，以便 logger 记录
-                    metrics.update(val_metrics)
-                    print(f"Testing finished. Metrics: {val_metrics}")
-                # =================================================================
-
-                metrics.update({
-                    "training/global_step": self.global_steps,
-                    "training/epoch": epoch
-                })
                 
-
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 
                 # --- Step 1: Data Alignment ---
@@ -1008,7 +988,6 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                             s_ids = s_ids[s_ids != self.tokenizer.pad_token_id]
                             s_resp_text = self.tokenizer.decode(s_ids, skip_special_tokens=True)
                             s_ans = extract_answer(s_resp_text)
-                            
                             # 3. 判定
                             # 简单的字符串匹配 (对于数学题通常足够)
                             # 移除逗号以防 "1,000" vs "1000"
@@ -1020,7 +999,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                             status_icon = "✅" if is_correct else "❌"
                             
                             print(f"--- [Answer Check] ---")
-                            print(f"Ground Truth Raw: {str(gt_raw)[-50:].strip()}...") # 只打印最后一点
+                            print(f"Ground Truth Raw: {str(gt_raw)[-50:].strip()}") # 只打印最后一点
                             print(f"Student Answer:   {s_ans}")
                             print(f"Target Answer:    {gt_ans}")
                             print(f"Result:           {status_icon} (Match: {is_correct})")
@@ -1281,7 +1260,26 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
-                
+                    is_last_step = self.global_steps >= self.total_training_steps
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.test_freq > 0
+                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                    ):
+                        print(f"Start Testing at step {self.global_steps}...")
+                        with marked_timer("testing", timing_raw, color="green"):
+                            # 调用父类 RayPPOTrainer 的 _validate 方法
+                            val_metrics: dict = self._validate() 
+                        
+                        # 将测试指标添加到 metrics 中，以便 logger 记录
+                        metrics.update(val_metrics)
+                        print(f"Testing finished. Metrics: {val_metrics}")
+                # =================================================================
+
+                metrics.update({
+                    "training/global_step": self.global_steps,
+                    "training/epoch": epoch
+                })
                 logger.log(data=metrics, step=self.global_steps)
                 progress_bar.update(1)
                 self.global_steps += 1
