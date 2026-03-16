@@ -734,7 +734,7 @@ class RayPPOTrainer:
                 "global_steps": self.global_steps,
             }
             if self.config.actor_rollout_ref.rollout.val_kwargs.get('val_max_response_length'):
-                test_gen_batch.meta_info["val_max_response_length"] = self.config.actor_rollout_ref.rollout.val_kwargs.val_max_response_length
+                test_gen_batch.meta_info["max_new_tokens"] = self.config.actor_rollout_ref.rollout.val_kwargs.val_max_response_length
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
