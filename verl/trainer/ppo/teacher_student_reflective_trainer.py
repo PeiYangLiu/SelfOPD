@@ -333,7 +333,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 safe_max_model_len = self.config.actor_rollout_ref.rollout.max_model_len
                 
             student_config.rollout.max_model_len = safe_max_model_len # <--- 真正安全的 vLLM 长度限制
-
+            print(f">>> [Config] Setting Student max_model_len = {student_config.rollout.max_model_len} (Prompt: {self.config.data.max_prompt_length} + Response: {actual_max_res_len} + Buffer: 512)")
 
             student_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
