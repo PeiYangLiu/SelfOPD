@@ -860,6 +860,9 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 
                 gen_batch = batch.pop(batch_keys=batch_keys_to_pop, non_tensor_batch_keys=non_tensor_batch_keys_to_pop)
                 gen_batch.meta_info['global_steps'] = self.global_steps
+                # === 新增：显式指定训练时的生成长度 ===
+                # 这样 vLLM 收到后会优先使用这个值
+                gen_batch.meta_info['max_tokens'] = self.config.data.max_response_length
                 gen_batch = gen_batch.repeat(repeat_times=N, interleave=True)
 
                 # --- Step 2: Student Generation ---
