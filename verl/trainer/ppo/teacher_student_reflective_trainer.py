@@ -178,11 +178,26 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             
             self.resource_pool_to_cls = {student_pool: {}, teacher_pool: {}}
 
-            # 3. 初始化 Config
+            # 3. Initialize Student (Actor) Config
             student_config = deepcopy(self.config.actor_rollout_ref)
-            raw_max_len = self.config.data.max_prompt_length + self.config.data.max_response_length
+            
+            # === 核心修复：计算 vLLM 引擎所需的最大上下文长度 ===
+            train_res_len = self.config.data.max_response_length
+            # 尝试获取 validation 的最大长度，如果没有则默认等于 train_res_len
+            val_res_len = self.config.actor_rollout_ref.rollout.val_kwargs.get("val_max_response_length", train_res_len)
+            
+            # 取训练和验证中所需的最大生成长度
+            actual_max_res_len = max(train_res_len, val_res_len)
+            raw_max_len = self.config.data.max_prompt_length + actual_max_res_len
             safe_max_model_len = raw_max_len + 512 
-            student_config.rollout.max_model_len = safe_max_model_len # <--- 修复 vLLM 长度限制
+            
+            # 如果你在 bash 脚本里显式指定了更大的 max_model_len (例如 40960)，则尊重 bash 脚本的设置
+            if OmegaConf.select(self.config, "actor_rollout_ref.rollout.max_model_len"):
+                safe_max_model_len = self.config.actor_rollout_ref.rollout.max_model_len
+                
+            student_config.rollout.max_model_len = safe_max_model_len # <--- 真正安全的 vLLM 长度限制
+
+            print(f">>> [Config] Setting Student max_model_len = {student_config.rollout.max_model_len} (Prompt: {self.config.data.max_prompt_length} + Response: {actual_max_res_len} + Buffer: 512)")
             student_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=student_config,
@@ -192,20 +207,21 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             self.resource_pool_to_cls[student_pool]["actor_rollout"] = student_cls
 
             teacher_config = deepcopy(self.config.actor_rollout_ref)
+            
+            # === 修复 Bug: 强制覆盖 Teacher 的 TP Size ===
+            if OmegaConf.select(self.config, "teacher.rollout.tensor_model_parallel_size"):
+                teacher_config.rollout.tensor_model_parallel_size = self.config.teacher.rollout.tensor_model_parallel_size
+                print(f">>> [Config] Overriding Teacher TP Size: {teacher_config.rollout.tensor_model_parallel_size}")
+                
+                # 如果底层模型配置里也有 tp 设置，一并覆盖以防万一
+                if OmegaConf.select(teacher_config, "model.tensor_model_parallel_size"):
+                    teacher_config.model.tensor_model_parallel_size = self.config.teacher.rollout.tensor_model_parallel_size
+            # ============================================
+
             # === NEW: Override Teacher Config ===
             if self.different_teacher_model:
                 teacher_config.model.path = self.config.teacher.model.path
                 print(f">>> [Config] Overriding Teacher Model Path: {teacher_config.model.path}")
-                
-                # 只有 Megatron 需要 TP，FSDP 通常不需要手动设置 TP，除非你用的是 Megatron 后端
-                # 但如果你的 Teacher 很大 (比如 72B)，可能需要 FSDP Sharding
-                # 注意：标准的 RefWorker (FSDP) 会自动处理 Sharding
-                
-                # 移除 vLLM 特有的配置，防止报错或误导
-                if 'rollout' in teacher_config:
-                    # 纯 Ref 不需要 gpu_memory_utilization，因为它不用 vLLM
-                    # 但保留它也无妨，只要 role="ref"，这些参数通常会被忽略
-                    pass
             
             teacher_config.model.torch_dtype = "bfloat16"
             
@@ -300,13 +316,25 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             self.resource_pool_to_cls = {student_pool: {}, teacher_pool: {}}
 
             # 3. Initialize Student (Actor) Config
-            # Deepcopy to prevent config pollution
             student_config = deepcopy(self.config.actor_rollout_ref)
-            # Adjust micro_batch_size if necessary (optional, but good practice since world_size changed)
-            # student_config.actor.ppo_mini_batch_size //= 2 # Logic handled by worker usually
-            raw_max_len = self.config.data.max_prompt_length + self.config.data.max_response_length
+            
+            # === 核心修复：计算 vLLM 引擎所需的最大上下文长度 ===
+            train_res_len = self.config.data.max_response_length
+            # 尝试获取 validation 的最大长度，如果没有则默认等于 train_res_len
+            val_res_len = self.config.actor_rollout_ref.rollout.val_kwargs.get("val_max_response_length", train_res_len)
+            
+            # 取训练和验证中所需的最大生成长度
+            actual_max_res_len = max(train_res_len, val_res_len)
+            raw_max_len = self.config.data.max_prompt_length + actual_max_res_len
             safe_max_model_len = raw_max_len + 512 
-            student_config.rollout.max_model_len = safe_max_model_len # <--- 修复 vLLM 长度限制
+            
+            # 如果你在 bash 脚本里显式指定了更大的 max_model_len (例如 40960)，则尊重 bash 脚本的设置
+            if OmegaConf.select(self.config, "actor_rollout_ref.rollout.max_model_len"):
+                safe_max_model_len = self.config.actor_rollout_ref.rollout.max_model_len
+                
+            student_config.rollout.max_model_len = safe_max_model_len # <--- 真正安全的 vLLM 长度限制
+
+
             student_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=student_config,
@@ -315,23 +343,22 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             )
             self.resource_pool_to_cls[student_pool]["actor_rollout"] = student_cls
 
-            # 4. Initialize Teacher (Ref) Config
-            # We define it as 'actor_rollout' role to FORCE vLLM initialization.
             teacher_config = deepcopy(self.config.actor_rollout_ref)
+            
+            # === 修复 Bug: 强制覆盖 Teacher 的 TP Size ===
+            if OmegaConf.select(self.config, "teacher.rollout.tensor_model_parallel_size"):
+                teacher_config.rollout.tensor_model_parallel_size = self.config.teacher.rollout.tensor_model_parallel_size
+                print(f">>> [Config] Overriding Teacher TP Size: {teacher_config.rollout.tensor_model_parallel_size}")
+                
+                # 如果底层模型配置里也有 tp 设置，一并覆盖以防万一
+                if OmegaConf.select(teacher_config, "model.tensor_model_parallel_size"):
+                    teacher_config.model.tensor_model_parallel_size = self.config.teacher.rollout.tensor_model_parallel_size
+            # ============================================
+
             # === NEW: Override Teacher Config ===
             if self.different_teacher_model:
                 teacher_config.model.path = self.config.teacher.model.path
                 print(f">>> [Config] Overriding Teacher Model Path: {teacher_config.model.path}")
-                
-                # 只有 Megatron 需要 TP，FSDP 通常不需要手动设置 TP，除非你用的是 Megatron 后端
-                # 但如果你的 Teacher 很大 (比如 72B)，可能需要 FSDP Sharding
-                # 注意：标准的 RefWorker (FSDP) 会自动处理 Sharding
-                
-                # 移除 vLLM 特有的配置，防止报错或误导
-                if 'rollout' in teacher_config:
-                    # 纯 Ref 不需要 gpu_memory_utilization，因为它不用 vLLM
-                    # 但保留它也无妨，只要 role="ref"，这些参数通常会被忽略
-                    pass
             
             teacher_config.model.torch_dtype = "bfloat16"
             
@@ -357,9 +384,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             
             # 同时保证 max_num_batched_tokens 和 max_model_len 也同步过来，防止 Teacher 爆显存
             teacher_config.rollout.max_num_batched_tokens = self.config.actor_rollout_ref.rollout.max_num_batched_tokens
-            if OmegaConf.select(self.config, "actor_rollout_ref.rollout.max_model_len"):
-                teacher_config.rollout.max_model_len = self.config.actor_rollout_ref.rollout.max_model_len
-
+            teacher_config.rollout.max_model_len = safe_max_model_len
             teacher_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.RefPolicy],
                 config=teacher_config,
