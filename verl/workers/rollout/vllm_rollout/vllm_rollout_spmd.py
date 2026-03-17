@@ -345,7 +345,7 @@ class vLLMRollout(BaseRollout):
             # ====================================================================
             # [核心修复] 获取当前实际允许的最大长度 (验证时为 38912，训练时为 14336)
             # ====================================================================
-            actual_max_length = kwargs.get("max_tokens", self.config.response_length)
+            actual_max_length = kwargs.get("max_tokens", self.config.val_kwargs.val_max_response_length)
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=actual_max_length).to(
                 idx.device
             )

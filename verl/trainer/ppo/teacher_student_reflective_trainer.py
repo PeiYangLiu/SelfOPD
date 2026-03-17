@@ -456,7 +456,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 p_text_clean = p_text_clean.replace("<|im_end|>", "")
             p_text_clean = p_text_clean.strip()
             # ----------------------------------------
-
+            print(f"debug --> length of response ids: {len(r_ids)}")
             r_text = self.tokenizer.decode(r_ids, skip_special_tokens=True)
             r_text = r_text.replace("<think>", "\n\n")
             r_text = r_text.replace("</think>", "\n\n")
