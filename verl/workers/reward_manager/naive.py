@@ -70,6 +70,7 @@ class NaiveRewardManager:
             response_ids = data_item.batch["responses"]
             valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
             valid_response_ids = response_ids[:valid_response_length]
+            print(f"DEBUG -> 真实生成长度: {valid_response_length.item()}")
             # decode
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)

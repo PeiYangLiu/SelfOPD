@@ -287,29 +287,37 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
-        if not do_sample:
-            kwargs = {
-                "best_of": 1,
-                "top_p": 1.0,
-                "top_k": -1,
-                "min_p": 0.0,
-                "temperature": 0,
-                "n": 1,  # if greedy, only 1 response
-            }
-        elif is_validate:
-            # TODO: try **
+        # === 核心修复 1: 统一获取目标长度的逻辑 ===
+        if is_validate:
+            # 1. 优先从 meta_info 拿 (由 trainer 传入)
+            # 2. 其次从 config.val_kwargs 拿
+            target_max_tokens = prompts.meta_info.get("max_tokens", self.config.val_kwargs.get("val_max_response_length", 1024))
             kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
-                "n": 1,  # if validate, already repeat in ray_trainer
+                "max_tokens": target_max_tokens, # 确保更新到 kwargs
+                "n": 1,
             }
-            # ====================================================================
-            # [核心修复] 从 meta_info 读取 val_max_response_length，并映射为 vLLM 需要的 max_tokens
-            # ====================================================================
-            if "val_max_response_length" in prompts.meta_info:
-                kwargs["max_tokens"] = prompts.meta_info["val_max_response_length"]
-                print("Using val_max_response_length from meta_info: ", kwargs["max_tokens"])
+        else:
+            # 训练模式
+            # 1. 优先从 meta_info 拿
+            # 2. 默认使用 config.response_length (即 data.max_response_length)
+            target_max_tokens = prompts.meta_info.get("max_tokens", self.config.response_length)
+            
+            if not do_sample:
+                kwargs = {
+                    "best_of": 1,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "min_p": 0.0,
+                    "temperature": 0,
+                    "max_tokens": target_max_tokens,
+                    "n": 1,
+                }
+            else:
+                # 正常采样
+                kwargs["max_tokens"] = target_max_tokens
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
@@ -345,7 +353,7 @@ class vLLMRollout(BaseRollout):
             # ====================================================================
             # [核心修复] 获取当前实际允许的最大长度 (验证时为 38912，训练时为 14336)
             # ====================================================================
-            actual_max_length = kwargs.get("max_tokens", self.config.val_kwargs.val_max_response_length)
+            actual_max_length = target_max_tokens
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=actual_max_length).to(
                 idx.device
             )
