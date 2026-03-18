@@ -478,7 +478,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 r"\[INST\]\s*",            # Llama
                 r"Human:\s*"               # Anthropic
             ]
-            
+            import re
             found_user = False
             for pattern in split_patterns:
                 matches = list(re.finditer(pattern, p_text_dirty, re.IGNORECASE))
@@ -495,6 +495,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 r"Assistant:",
                 r"\[/INST\]"
             ]
+            import re
             for pattern in stop_patterns:
                 match = re.search(pattern, p_text_clean, re.IGNORECASE) # 使用 escape 防止正则错误
                 if match:
@@ -621,7 +622,7 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             p_ids = prompts[i]
             p_ids = p_ids[p_ids != self.tokenizer.pad_token_id]
             p_text_dirty = self.tokenizer.decode(p_ids, skip_special_tokens=False)
-            
+            import re
             # 清洗 User Query
             p_text_clean = p_text_dirty
             split_patterns = [r"<\|im_start\|>user\s*", r"user\s*\n", r"User:\s*", r"\[INST\]\s*", r"Human:\s*"]
