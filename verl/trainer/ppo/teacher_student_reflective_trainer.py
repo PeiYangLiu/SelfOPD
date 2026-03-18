@@ -1121,7 +1121,6 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     
                     # 计算原始差异 (用于观察)
                     kl_diff = t_part - s_part
-                    distill_reward = kl_diff
 
                     # =================================================================
                     # === FIX: Add Debug Metrics (Logits Statistics) ===
@@ -1270,19 +1269,17 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 student_log_prob_output.batch.pop('entropys', None)
                 batch = batch.union(student_log_prob_output)
 
-                if "values" not in batch.batch.keys():
-                    batch.batch["values"] = torch.zeros_like(batch.batch["token_level_rewards"])
-
-                # === 核心修改: 禁用 GAE (compute_advantage) ===
-                # 专家建议使用 K2 Loss (MSE)，这意味着不需要 GAE 的时间平滑。
-                # 直接将 advantages 设为 0 (或者 diff)，因为 dp_actor 会忽略它，直接用 ref_log_prob 算 MSE。
-                # 为了防止 verl 内部报错，我们保留数据结构。
-                batch.batch['advantages'] = torch.zeros_like(batch.batch['token_level_rewards'])
-                batch.batch['returns'] = torch.zeros_like(batch.batch['token_level_rewards'])
-                
-                # 原有的 compute_advantage 被注释掉，避免 GAE 引入偏差
-                # with marked_timer("adv", timing_raw):
-                #     batch = compute_advantage(...)
+                # 【核心修改 3】：恢复 GAE (compute_advantage) 的计算
+                # 这一步会调用 Critic 算出 values，并结合 token_level_rewards 算出 advantages
+                with marked_timer("adv", timing_raw):
+                    batch = compute_advantage(
+                        batch,
+                        adv_estimator=self.config.algorithm.adv_estimator, # 默认是 GAE
+                        gamma=self.config.algorithm.gamma,
+                        lam=self.config.algorithm.lam,
+                        num_repeat=self.config.actor_rollout_ref.rollout.n,
+                        config=self.config.algorithm,
+                    )
 
                 with marked_timer("update_actor", timing_raw):
                     actor_output = self.actor_rollout_wg.update_actor(batch)
