@@ -669,8 +669,12 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 s_ids = summaries[i]
                 s_ids = s_ids[s_ids != self.teacher_tokenizer.pad_token_id]
                 s_text = self.teacher_tokenizer.decode(s_ids, skip_special_tokens=True)
-                if s_text.find('</think>') != -1:
-                    s_text[s_text.find('</think>')+len('</think>'):]
+                import re
+                # 移除所有 <think>...</think> 块，包括跨行的内容
+                s_text = re.sub(r'<think>.*?</think>', '', s_text, flags=re.DOTALL).strip()
+                # 防御性编程：如果模型没生成 </think>，但生成了 <think>
+                if '<think>' in s_text:
+                    s_text = s_text.split('<think>')[0].strip()
                 # System Prompt 注入 Hint
                 system_content = (
                     "You are a helpful math assistant."
