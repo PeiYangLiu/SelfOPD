@@ -205,7 +205,13 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 profile_option=self.config.trainer.npu_profile.options,
             )
             self.resource_pool_to_cls[student_pool]["actor_rollout"] = student_cls
-
+            # 【新增代码 1】：把 Critic 也放进 student_pool
+            if self.use_critic:
+                critic_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.Critic],
+                    config=self.config.critic,
+                )
+                self.resource_pool_to_cls[student_pool]["critic"] = critic_cls
             teacher_config = deepcopy(self.config.actor_rollout_ref)
             
             # === 修复 Bug: 强制覆盖 Teacher 的 TP Size ===
@@ -268,6 +274,11 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             self.actor_rollout_wg = all_wg["actor_rollout"]
             self.actor_rollout_wg.init_model()
             
+            # 【新增代码 2】：初始化 Critic
+            if self.use_critic:
+                self.critic_wg = all_wg["critic"]
+                self.critic_wg.init_model()
+
             self.ref_policy_wg = all_wg["ref"]
             self.ref_policy_wg.init_model()
                 
@@ -343,6 +354,14 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             )
             self.resource_pool_to_cls[student_pool]["actor_rollout"] = student_cls
 
+            # 【新增代码 1】：把 Critic 也放进 student_pool
+            if self.use_critic:
+                critic_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.Critic],
+                    config=self.config.critic,
+                )
+                self.resource_pool_to_cls[student_pool]["critic"] = critic_cls
+
             teacher_config = deepcopy(self.config.actor_rollout_ref)
             
             # === 修复 Bug: 强制覆盖 Teacher 的 TP Size ===
@@ -413,7 +432,12 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
             # 6. Bind to Trainer
             self.actor_rollout_wg = all_wg["actor_rollout"]
             self.actor_rollout_wg.init_model()
-            
+
+            # 【新增代码 2】：初始化 Critic
+            if self.use_critic:
+                self.critic_wg = all_wg["critic"]
+                self.critic_wg.init_model()  
+
             self.ref_policy_wg = all_wg["ref"]
             self.ref_policy_wg.init_model()
                 
@@ -1269,6 +1293,12 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                 student_log_prob_output.batch.pop('entropys', None)
                 batch = batch.union(student_log_prob_output)
 
+                # 【新增代码 3】：调用 Critic 计算 values
+                if self.use_critic:
+                    with marked_timer("values", timing_raw, color="cyan"):
+                        values = self.critic_wg.compute_values(batch)
+                        batch = batch.union(values)
+
                 # 【核心修改 3】：恢复 GAE (compute_advantage) 的计算
                 # 这一步会调用 Critic 算出 values，并结合 token_level_rewards 算出 advantages
                 with marked_timer("adv", timing_raw):
@@ -1280,6 +1310,13 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                         num_repeat=self.config.actor_rollout_ref.rollout.n,
                         config=self.config.algorithm,
                     )
+
+                # 【新增代码 4】：更新 Critic
+                if self.use_critic:
+                    with marked_timer("update_critic", timing_raw, color="pink"):
+                        critic_output = self.critic_wg.update_critic(batch)
+                    critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                    metrics.update(critic_output_metrics)
 
                 with marked_timer("update_actor", timing_raw):
                     actor_output = self.actor_rollout_wg.update_actor(batch)
