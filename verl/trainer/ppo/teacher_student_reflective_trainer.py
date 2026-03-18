@@ -576,16 +576,16 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
         })
         # === FIX: 增强 Summary 生成的鲁棒性 ===
         
-        # 1. 尝试读取配置，如果读不到，直接给 4096
+        # 1. 尝试读取配置，如果读不到，直接给 1024
         # 注意：OmegaConf 有时需要用 .key 访问，有时用 get
         try:
             max_tokens = self.config.data.summary_max_new_tokens
         except:
-            max_tokens = 4096
+            max_tokens = 1024
             
         # 强制保底，防止配置里只有 256 之类的
         if max_tokens < 1024:
-            max_tokens = 4096
+            max_tokens = 1024
             
         # 2. 打印调试信息 (只打印一次)
         if self.global_steps == 1:
