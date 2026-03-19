@@ -113,14 +113,14 @@ class NaiveRewardManager:
 
             if already_print_data_sources[data_source] < self.num_examine:
                 already_print_data_sources[data_source] += 1
-                print("[prompt]", prompt_str)
-                print("[response]", response_str)
-                print("[ground_truth]", ground_truth)
-                if isinstance(score, dict):
-                    for key, value in score.items():
-                        print(f"[{key}]", value)
-                else:
-                    print("[score]", score)
+                # print("[prompt]", prompt_str[:500])
+                # print("[response]", response_str[:500])
+                # print("[ground_truth]", ground_truth[:500])
+                # if isinstance(score, dict):
+                #     for key, value in score.items():
+                #         print(f"[{key}]", value)
+                # else:
+                #     print("[score]", score)
 
         # Log all error cases
         if error_cases:
