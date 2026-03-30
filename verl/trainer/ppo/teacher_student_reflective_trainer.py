@@ -13,7 +13,7 @@ import uuid
 from tqdm import tqdm
 from verl.trainer.ppo.core_algos import AdvantageEstimator
 from verl.utils.debug import marked_timer
-from verl.utils.torch_functional import masked_mean
+from verl.utils.torch_functional import masked_mean, masked_whiten
 from verl.utils.tracking import Tracking
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.reward_score.math_dapo import is_correct_minerva
@@ -955,15 +955,19 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                     else:
                         current_ground_truths = [""] * len(tensor_prompts)
 
-                    # 3.3 Student Generates Summary
-                    summary_input_batch = self._prepare_summary_generation_batch(
-                        batch, 
-                        decoded_prompts, 
-                        current_ground_truths
-                    )
-                    
-                    summary_output = self.actor_rollout_wg.generate_sequences(summary_input_batch)
-                    summaries = summary_output.batch['responses']
+                    # 3.3 Student Generates Summary (skip for standard distillation to save compute)
+                    if self.standard_distillation:
+                        summaries = None
+                        summary_input_batch = None
+                    else:
+                        summary_input_batch = self._prepare_summary_generation_batch(
+                            batch, 
+                            decoded_prompts, 
+                            current_ground_truths
+                        )
+                        
+                        summary_output = self.actor_rollout_wg.generate_sequences(summary_input_batch)
+                        summaries = summary_output.batch['responses']
                     
                     # 3.4 Teacher Computes LogProb
                     teacher_batch = self._prepare_teacher_forward_batch(batch, summaries, current_ground_truths)
@@ -1018,15 +1022,21 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                         print(f"\n{'='*20} Teacher-Student Reflection Debug (Step {self.global_steps}) {'='*20}")
                         try:
                             idx = 0 
-                            # Summary Input
-                            sum_in_ids = summary_input_batch.batch['input_ids'][idx]
-                            sum_in_ids = sum_in_ids[sum_in_ids != self.tokenizer.pad_token_id]
-                            sum_in_text = self.tokenizer.decode(sum_in_ids, skip_special_tokens=False)
+                            # Summary Input (only available in reflective mode)
+                            if summary_input_batch is not None:
+                                sum_in_ids = summary_input_batch.batch['input_ids'][idx]
+                                sum_in_ids = sum_in_ids[sum_in_ids != self.tokenizer.pad_token_id]
+                                sum_in_text = self.tokenizer.decode(sum_in_ids, skip_special_tokens=False)
+                            else:
+                                sum_in_text = "[Skipped - Standard Distillation]"
                             
                             # Summary Output
-                            s_ids = summaries[idx]
-                            s_ids = s_ids[s_ids != self.tokenizer.pad_token_id]
-                            s_text = self.tokenizer.decode(s_ids, skip_special_tokens=True)
+                            if summaries is not None:
+                                s_ids = summaries[idx]
+                                s_ids = s_ids[s_ids != self.tokenizer.pad_token_id]
+                                s_text = self.tokenizer.decode(s_ids, skip_special_tokens=True)
+                            else:
+                                s_text = "[Skipped - Standard Distillation]"
                             
                             # Teacher Input
                             t_full_ids = teacher_batch.batch['input_ids'][idx]
@@ -1197,10 +1207,11 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                         metrics['debug/student_resp_len_min'] = student_resp_lens.min().item()
                         
                         # 3. Teacher Summary Length (老师总结的长度)
-                        summary_lens = (summaries != t_pad_id).sum(dim=-1).float()
-                        metrics['debug/teacher_summary_len_mean'] = summary_lens.mean().item()
-                        metrics['debug/teacher_summary_len_max'] = summary_lens.max().item()
-                        metrics['debug/teacher_summary_len_min'] = summary_lens.min().item()
+                        if summaries is not None:
+                            summary_lens = (summaries != t_pad_id).sum(dim=-1).float()
+                            metrics['debug/teacher_summary_len_mean'] = summary_lens.mean().item()
+                            metrics['debug/teacher_summary_len_max'] = summary_lens.max().item()
+                            metrics['debug/teacher_summary_len_min'] = summary_lens.min().item()
                         
                         # 4. Teacher Forward Length (老师重新计算概率时的总上下文长度)
                         teacher_forward_lens = (teacher_batch.batch['input_ids'] != t_pad_id).sum(dim=-1).float()
@@ -1303,17 +1314,17 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
                         values = self.critic_wg.compute_values(batch)
                         batch = batch.union(values)
 
-                # 【核心修改 3】：恢复 GAE (compute_advantage) 的计算
-                # 这一步会调用 Critic 算出 values，并结合 token_level_rewards 算出 advantages
+                # 【核心修复】：直接使用逐 token KL 差作为 advantage (标准 OPD)
+                # 之前的 GRPO 会把逐 token 的 KL 信号 sum 成序列级标量再广播回去，
+                # 完全丢失了 OPD 的密集 per-token 反馈信号。
+                # 正确做法：advantage[t] = teacher_logp[t] - student_logp[t]
                 with marked_timer("adv", timing_raw):
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator, # 默认是 GAE
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                        num_repeat=self.config.actor_rollout_ref.rollout.n,
-                        config=self.config.algorithm,
-                    )
+                    response_mask = batch.batch['response_mask']
+                    # token_level_rewards 已经是 kl_diff = teacher_logp - student_logp
+                    kl_advantage = batch.batch['token_level_rewards']
+                    # Whitening: 对 advantage 做归一化以稳定训练
+                    batch.batch['advantages'] = masked_whiten(kl_advantage, response_mask)
+                    batch.batch['returns'] = batch.batch['advantages']  # placeholder for logging
 
                 # 【新增代码 4】：更新 Critic
                 if self.use_critic:
