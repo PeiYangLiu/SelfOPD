@@ -4,6 +4,7 @@ from typing import List, Dict, Optional
 from copy import deepcopy
 from torch.nn.utils.rnn import pad_sequence
 import re
+from math import gcd
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, compute_response_mask, compute_advantage, Role
 from verl.utils.metric import (
@@ -20,6 +21,10 @@ from verl.utils.reward_score.math_dapo import is_correct_minerva
 from omegaconf import OmegaConf, open_dict
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
+
+
+def _lcm(a: int, b: int) -> int:
+    return a * b // gcd(a, b)
 
 def left_to_right_padding(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
@@ -70,7 +75,99 @@ class TeacherStudentReflectiveTrainer(RayPPOTrainer):
     def _validate_config(self):
         pass
 
+    @staticmethod
+    def _auto_compute_batch_sizes(config):
+        """
+        根据 GPU 拓扑自动计算 train_batch_size 和 ppo_mini_batch_size。
+        
+        约束关系：
+        - total_samples = train_batch_size × N (rollouts per prompt)
+        - total_samples 必须能被 student_total_gpus 整除 (generation/logprob dispatch)
+        - total_samples 必须能被 teacher_total_gpus 整除 (teacher logprob dispatch)
+        - total_samples / student_total_gpus 必须能被 micro_batch_size_per_gpu 整除 (micro-batching)
+        - ppo_mini_batch_size 设为 train_batch_size (每个 PPO epoch 有 N 个 mini-batch)
+        
+        用户可通过 +trainer.batch_size_multiplier=K 手动控制倍率。
+        """
+        n_gpus_per_node = config.trainer.n_gpus_per_node
+        nnodes = config.trainer.nnodes
+        
+        # Teacher / Student TP
+        teacher_tp = OmegaConf.select(config, "teacher.rollout.tensor_model_parallel_size") or 1
+        student_tp = config.actor_rollout_ref.rollout.tensor_model_parallel_size
+        N = config.actor_rollout_ref.rollout.n
+        micro_bsz = config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+        
+        # GPU 拓扑
+        student_gpus_per_node = n_gpus_per_node - teacher_tp
+        
+        # === TP 可行性校验 ===
+        if student_gpus_per_node <= 0:
+            raise ValueError(
+                f"[Auto Batch] teacher_tp={teacher_tp} 占满了每节点所有 {n_gpus_per_node} 张卡，"
+                f"没有 GPU 留给 Student！请减小 teacher.rollout.tensor_model_parallel_size。"
+            )
+        if student_gpus_per_node % student_tp != 0:
+            raise ValueError(
+                f"[Auto Batch] student_gpus_per_node={student_gpus_per_node} "
+                f"(= n_gpus_per_node({n_gpus_per_node}) - teacher_tp({teacher_tp})) "
+                f"不能被 student_tp={student_tp} 整除！\n"
+                f"请调整 tensor_model_parallel_size 使两边 TP 兼容，例如:\n"
+                f"  teacher_tp={student_tp}, student_tp={student_tp} → student_gpus={n_gpus_per_node - student_tp}/node"
+            )
+        
+        student_total_gpus = student_gpus_per_node * nnodes
+        teacher_total_gpus = teacher_tp * nnodes
+        student_dp_size = student_total_gpus // student_tp
+        teacher_dp_size = teacher_total_gpus // teacher_tp  # = nnodes
+        
+        # 计算 total_samples 必须满足的最小公倍数
+        # 1) student_total_gpus × micro_bsz (micro-batching, 蕴含了对 student_total_gpus 的整除)
+        # 2) teacher_total_gpus (teacher dispatch)
+        # 3) N (保证 train_batch_size 是整数)
+        total_unit = _lcm(student_total_gpus * micro_bsz, teacher_total_gpus)
+        total_unit = _lcm(total_unit, N)
+        
+        # 最小合法 train_batch_size
+        base_train_bs = total_unit // N
+        
+        # 计算倍率：用户可手动指定，否则自动按 "每 GPU ~8 个 samples" 来定
+        multiplier = OmegaConf.select(config, "trainer.batch_size_multiplier")
+        if multiplier is None:
+            target_per_gpu = max(micro_bsz * 4, 8)
+            target_total = student_total_gpus * target_per_gpu
+            multiplier = max(1, target_total // total_unit)
+        
+        train_batch_size = base_train_bs * int(multiplier)
+        ppo_mini_batch_size = train_batch_size  # N mini-batches per PPO epoch
+        total_samples = train_batch_size * N
+        per_gpu = total_samples // student_total_gpus
+        grad_accum = per_gpu // micro_bsz
+        
+        # 写回 config
+        with open_dict(config):
+            config.data.train_batch_size = train_batch_size
+            config.actor_rollout_ref.actor.ppo_mini_batch_size = ppo_mini_batch_size
+        
+        print(f"\n{'='*20} Auto Batch Size Computation {'='*20}")
+        print(f"GPU Topology: {nnodes} nodes × {n_gpus_per_node} GPUs/node = {nnodes * n_gpus_per_node} total")
+        print(f"  Student: {student_gpus_per_node} GPUs/node × {nnodes} = {student_total_gpus} GPUs (TP={student_tp}, DP={student_dp_size})")
+        print(f"  Teacher: {teacher_tp} GPUs/node × {nnodes} = {teacher_total_gpus} GPUs (TP={teacher_tp}, DP={teacher_dp_size})")
+        print(f"  N={N} rollouts, micro_batch_per_gpu={micro_bsz}, multiplier={multiplier}")
+        print(f">>> train_batch_size     = {train_batch_size}  (prompts per step)")
+        print(f">>> ppo_mini_batch_size  = {ppo_mini_batch_size}")
+        print(f">>> total_samples        = {total_samples}  ({train_batch_size} × {N})")
+        print(f">>> per_gpu              = {per_gpu} samples, grad_accum = {grad_accum}")
+        print(f"{'='*60}\n")
+
     def __init__(self, *args, **kwargs):
+        # 在 super().__init__() 创建 DataLoader 之前，先自动计算 batch sizes
+        config = kwargs.get('config', args[0] if args else None)
+        if config is not None:
+            auto_bs = OmegaConf.select(config, "trainer.auto_batch_size")
+            if auto_bs is None or auto_bs:  # 默认开启
+                self._auto_compute_batch_sizes(config)
+
         super().__init__(*args, **kwargs)
         assert self.use_reference_policy, "TeacherStudentReflectiveTrainer requires a Reference Policy (Teacher)!"
         self.use_critic = False
